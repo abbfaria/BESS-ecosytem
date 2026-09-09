@@ -1,0 +1,115 @@
+{
+  "__inputs": [],
+  "__requires": [],
+  "annotations": { "list": [] },
+  "description": "BESS Fleet Overview — Power flows, SoC, Grid status",
+  "editable": true,
+  "graphTooltip": 1,
+  "id": null,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Battery SoC (%)",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0, "max": 100, "unit": "percent",
+          "thresholds": {
+            "steps": [
+              { "color": "red",    "value": 0  },
+              { "color": "yellow", "value": 20 },
+              { "color": "green",  "value": 40 }
+            ]
+          }
+        }
+      },
+      "targets": [{
+        "refId": "A",
+        "datasource": "InfluxDB-BESS",
+        "query": "from(bucket:\"telemetry\") |> range(start: -5m) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"battery_soc_pct\") |> last()"
+      }]
+    },
+    {
+      "id": 2,
+      "title": "PV Generation (W)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 9, "x": 6, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "watt", "color": { "fixedColor": "yellow", "mode": "fixed" } } },
+      "targets": [{
+        "refId": "A",
+        "datasource": "InfluxDB-BESS",
+        "query": "from(bucket:\"telemetry\") |> range(start: -1h) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"pv_power_w\") |> aggregateWindow(every: 1m, fn: mean)"
+      }]
+    },
+    {
+      "id": 3,
+      "title": "Power Flows (W)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 9, "x": 15, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "watt" } },
+      "targets": [
+        {
+          "refId": "A", "legendFormat": "PV",
+          "datasource": "InfluxDB-BESS",
+          "query": "from(bucket:\"telemetry\") |> range(start: -1h) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"pv_power_w\") |> aggregateWindow(every: 1m, fn: mean)"
+        },
+        {
+          "refId": "B", "legendFormat": "Battery (+chg/-dis)",
+          "datasource": "InfluxDB-BESS",
+          "query": "from(bucket:\"telemetry\") |> range(start: -1h) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"battery_power_w\") |> aggregateWindow(every: 1m, fn: mean)"
+        },
+        {
+          "refId": "C", "legendFormat": "Grid (+import/-export)",
+          "datasource": "InfluxDB-BESS",
+          "query": "from(bucket:\"telemetry\") |> range(start: -1h) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"grid_power_w\") |> aggregateWindow(every: 1m, fn: mean)"
+        },
+        {
+          "refId": "D", "legendFormat": "Load",
+          "datasource": "InfluxDB-BESS",
+          "query": "from(bucket:\"telemetry\") |> range(start: -1h) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"house_load_w\") |> aggregateWindow(every: 1m, fn: mean)"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Battery Temperature (°C)",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": { "unit": "celsius",
+          "thresholds": { "steps": [
+            { "color": "green", "value": 0  },
+            { "color": "yellow","value": 40 },
+            { "color": "red",   "value": 50 }
+          ]}
+        }
+      },
+      "targets": [{
+        "refId": "A",
+        "datasource": "InfluxDB-BESS",
+        "query": "from(bucket:\"telemetry\") |> range(start: -1h) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"battery_temp_c\") |> aggregateWindow(every: 1m, fn: mean)"
+      }]
+    },
+    {
+      "id": 5,
+      "title": "Grid Voltage (V)",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "volt", "min": 195, "max": 253 } },
+      "targets": [{
+        "refId": "A",
+        "datasource": "InfluxDB-BESS",
+        "query": "from(bucket:\"telemetry\") |> range(start: -1h) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"grid_voltage_v\") |> aggregateWindow(every: 1m, fn: mean)"
+      }]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["bess", "energy", "monitoring"],
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "BESS Fleet Overview",
+  "uid": "bess-overview-v1",
+  "version": 1
+}

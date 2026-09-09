@@ -1,0 +1,41 @@
+# Edge node Python dependencies
+# Python 3.11+
+
+# Async core
+asyncio-mqtt==0.16.2        # backup MQTT option (not used directly but available)
+
+# MQTT
+paho-mqtt==2.1.0
+
+# HTTP for DAM price fetching
+aiohttp==3.9.5
+aiohttp-retry==2.8.3
+
+# Data validation
+pydantic==2.7.1
+
+# FastAPI local management API
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+
+# MILP optimization
+PuLP==2.8.0
+
+# Scheduling
+APScheduler==3.10.4
+
+# Structured logging
+structlog==24.1.0
+
+# Database
+# SQLite is stdlib — no extra package needed
+
+# Config file parsing
+PyYAML==6.0.1
+
+# Optional: for actual Modbus RTU (Raspberry Pi with RS-485 hat)
+# pymodbus==3.6.7
+
+# Dev/test extras (not installed in production image)
+# pytest==8.2.0
+# pytest-asyncio==0.23.6

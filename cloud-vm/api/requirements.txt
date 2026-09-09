@@ -1,0 +1,20 @@
+# Cloud API dependencies
+
+# Async MQTT
+aiomqtt==2.3.0
+
+# FastAPI
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+
+# InfluxDB 2.x async client
+influxdb-client[async]==1.43.0
+
+# Data validation
+pydantic==2.7.1
+
+# Structured logging
+structlog==24.1.0
+
+# HTTP
+aiohttp==3.9.5

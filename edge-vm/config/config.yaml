@@ -1,0 +1,61 @@
+# Edge node configuration
+# Override with environment variables (takes precedence over this file)
+
+device:
+  id: "bess-edge-01"
+  location: "Kyiv, UA"
+  firmware_version: "1.0.0"
+
+mqtt:
+  host: "cloud.bess.local"
+  port: 8883
+  keepalive_s: 30
+  ca_cert:      "/certs/ca.crt"
+  client_cert:  "/certs/edge.crt"
+  client_key:   "/certs/edge.key"
+
+bess:
+  # PV array
+  pv_peak_kw: 10.0
+  inverter_efficiency: 0.97
+
+  # Wind turbine (set to 0 to disable)
+  wind_peak_kw: 2.0
+
+  # Battery (LiFePO4 16S 48V 20 kWh)
+  battery_capacity_kwh: 20.0
+  battery_charge_kw_max: 5.0
+  battery_discharge_kw_max: 5.0
+  charge_efficiency: 0.96
+  discharge_efficiency: 0.96
+  soc_min_pct: 10.0
+  soc_max_pct: 95.0
+  initial_soc_pct: 50.0
+
+  # House baseline load
+  base_load_w: 400.0
+
+optimizer:
+  # MILP enabled if PuLP is installed
+  prefer_milp: true
+  max_daily_throughput_kwh: 20.0
+  min_spread_uah_mwh: 500.0
+
+market:
+  # ENTSO-E security token (optional fallback)
+  entsoe_token: ""
+  cache_ttl_min: 30
+
+telemetry:
+  interval_s: 10
+  buffer_max_messages: 10000
+  buffer_max_age_hours: 24
+
+api:
+  host: "0.0.0.0"
+  port: 8000
+
+logging:
+  level: "INFO"
+
+data_dir: "/data"

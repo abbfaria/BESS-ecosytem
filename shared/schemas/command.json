@@ -1,0 +1,16 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "bess/command",
+  "title": "BESS Command Payload",
+  "type": "object",
+  "required": ["cmd_id", "ts", "device_id", "mode"],
+  "properties": {
+    "cmd_id":       { "type": "string" },
+    "ts":           { "type": "string", "format": "date-time" },
+    "device_id":    { "type": "string" },
+    "mode":         { "type": "string", "enum": ["SOLAR_PRIORITY","GRID_CHARGE","DISCHARGE_SELL","BACKUP_MODE","IDLE"] },
+    "power_pct":    { "type": "number", "minimum": 0, "maximum": 100 },
+    "duration_min": { "type": "integer", "minimum": 1, "maximum": 1440 },
+    "issued_by":    { "type": "string" }
+  }
+}
