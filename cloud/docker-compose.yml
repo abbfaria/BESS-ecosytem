@@ -75,6 +75,7 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: "${GF_ADMIN_PASSWORD:-changeme}"
       GF_INSTALL_PLUGINS:         "grafana-clock-panel,grafana-simple-json-datasource"
       GF_SERVER_ROOT_URL:         "${GF_ROOT_URL:-http://localhost:3000}"
+      INFLUXDB_TOKEN:             "${INFLUXDB_TOKEN:-dev-token-change-in-prod}"
     volumes:
       - grafana-data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
