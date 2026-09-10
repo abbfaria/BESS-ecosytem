@@ -14,8 +14,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install -r edge-vm/requirements.txt
-      - run: python -m pytest tests/ -v
+      - run: pip install -r edge/requirements.txt
+      - run: python -m unittest discover -s tests -v
 
   # Deploy jobs run only on a direct push to main (never on pull_request),
   # since they execute on self-hosted runners with real access to the VMs.
@@ -29,7 +29,7 @@ jobs:
         run: |
           rsync -a --delete \
             --exclude '.env' --exclude 'certs/' --exclude 'data/' --exclude '__pycache__/' \
-            cloud-vm/ "$HOME/Code/bess-ecosystem/cloud/"
+            cloud/ "$HOME/Code/bess-ecosystem/cloud/"
       - name: Build and deploy
         run: |
           cd "$HOME/Code/bess-ecosystem/cloud"
@@ -49,7 +49,7 @@ jobs:
         run: |
           rsync -a --delete \
             --exclude '.env' --exclude 'certs/' --exclude 'data/' --exclude '__pycache__/' \
-            edge-vm/ "$HOME/Code/bess-ecosystem/edge/"
+            edge/ "$HOME/Code/bess-ecosystem/edge/"
       - name: Build and deploy
         run: |
           cd "$HOME/Code/bess-ecosystem/edge"
