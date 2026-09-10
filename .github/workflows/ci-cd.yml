@@ -1,0 +1,60 @@
+name: BESS CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r edge-vm/requirements.txt
+      - run: python -m pytest tests/ -v
+
+  # Deploy jobs run only on a direct push to main (never on pull_request),
+  # since they execute on self-hosted runners with real access to the VMs.
+  deploy-cloud:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, cloud]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sync code (preserve .env / certs / data)
+        run: |
+          rsync -a --delete \
+            --exclude '.env' --exclude 'certs/' --exclude 'data/' --exclude '__pycache__/' \
+            cloud-vm/ "$HOME/Code/bess-ecosystem/cloud/"
+      - name: Build and deploy
+        run: |
+          cd "$HOME/Code/bess-ecosystem/cloud"
+          docker compose -p bess-cloud up -d --build
+      - name: Health check
+        run: |
+          sleep 10
+          curl -sf http://localhost:8080/health
+
+  deploy-edge:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, edge]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sync code (preserve .env / certs / data)
+        run: |
+          rsync -a --delete \
+            --exclude '.env' --exclude 'certs/' --exclude 'data/' --exclude '__pycache__/' \
+            edge-vm/ "$HOME/Code/bess-ecosystem/edge/"
+      - name: Build and deploy
+        run: |
+          cd "$HOME/Code/bess-ecosystem/edge"
+          docker compose up -d --build
+      - name: Health check
+        run: |
+          sleep 10
+          curl -sf http://localhost:8000/api/v1/status
