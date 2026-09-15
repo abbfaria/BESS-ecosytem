@@ -133,7 +133,7 @@
       "targets": [{
         "refId": "A",
         "datasource": "InfluxDB-BESS",
-        "query": "import \"date\"\nfrom(bucket:\"telemetry\") |> range(start: date.truncate(t: now(), unit: 1d)) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"revenue_uah\") |> sum()"
+        "query": "import \"date\"\nfrom(bucket:\"telemetry\") |> range(start: date.truncate(t: now(), unit: 1d)) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"revenue_uah\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> sum()"
       }]
     },
     {
@@ -151,7 +151,7 @@
       "targets": [{
         "refId": "A",
         "datasource": "InfluxDB-BESS",
-        "query": "import \"date\"\ny0 = date.add(d: -1d, to: date.truncate(t: now(), unit: 1d))\ny1 = date.truncate(t: now(), unit: 1d)\nfrom(bucket:\"telemetry\") |> range(start: y0, stop: y1) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"revenue_uah\") |> sum()"
+        "query": "import \"date\"\ny0 = date.add(d: -1d, to: date.truncate(t: now(), unit: 1d))\ny1 = date.truncate(t: now(), unit: 1d)\nfrom(bucket:\"telemetry\") |> range(start: y0, stop: y1) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"revenue_uah\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> sum()"
       }]
     },
     {
@@ -164,7 +164,7 @@
       "targets": [{
         "refId": "A",
         "datasource": "InfluxDB-BESS",
-        "query": "import \"date\"\nt0 = date.add(d: 1d, to: date.truncate(t: now(), unit: 1d))\nt1 = date.add(d: 2d, to: date.truncate(t: now(), unit: 1d))\nfrom(bucket:\"telemetry\") |> range(start: t0, stop: t1) |> filter(fn:(r) => r._measurement == \"schedule\" and r._field == \"expected_revenue_uah\") |> sum()"
+        "query": "import \"date\"\nt0 = date.add(d: 1d, to: date.truncate(t: now(), unit: 1d))\nt1 = date.add(d: 2d, to: date.truncate(t: now(), unit: 1d))\nfrom(bucket:\"telemetry\") |> range(start: t0, stop: t1) |> filter(fn:(r) => r._measurement == \"schedule\" and r._field == \"expected_revenue_uah\") |> drop(columns: [\"mode\", \"device_id\"]) |> sum()"
       }]
     },
     {
@@ -183,7 +183,7 @@
       "targets": [{
         "refId": "A",
         "datasource": "InfluxDB-BESS",
-        "query": "import \"date\"\ncapex = float(v: \"${capex_uah}\")\navgDaily = from(bucket:\"telemetry\") |> range(start: -30d) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"revenue_uah\") |> aggregateWindow(every: 1d, fn: sum, createEmpty: false) |> mean(column: \"_value\")\navgDaily |> map(fn: (r) => ({ r with _value: if r._value > 0.0 then capex / (r._value * 30.0) else -1.0 }))"
+        "query": "import \"date\"\ncapex = float(v: \"${capex_uah}\")\navgDaily = from(bucket:\"telemetry\") |> range(start: -30d) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"revenue_uah\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> aggregateWindow(every: 1d, fn: sum, createEmpty: false) |> mean(column: \"_value\")\navgDaily |> map(fn: (r) => ({ r with _value: if r._value > 0.0 then capex / (r._value * 30.0) else -1.0 }))"
       }]
     },
     {
@@ -207,5 +207,5 @@
   "timezone": "browser",
   "title": "BESS – Огляд системи",
   "uid": "bess-overview-v1",
-  "version": 7
+  "version": 8
 }
