@@ -39,7 +39,7 @@
       "targets": [{
         "refId": "A",
         "datasource": "InfluxDB-BESS",
-        "query": "from(bucket:\"telemetry\") |> range(start: -5m) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"battery_soc_pct\") |> last()"
+        "query": "from(bucket:\"telemetry\") |> range(start: -5m) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"battery_soc_pct\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> last()"
       }]
     },
     {
@@ -207,5 +207,5 @@
   "timezone": "browser",
   "title": "BESS – Огляд системи",
   "uid": "bess-overview-v1",
-  "version": 8
+  "version": 9
 }
