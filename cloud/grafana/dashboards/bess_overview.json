@@ -52,7 +52,7 @@
       "targets": [{
         "refId": "A",
         "datasource": "InfluxDB-BESS",
-        "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nfrom(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"pv_power_w\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> set(key: \"_field\", value: \"Сонячні панелі\") |> aggregateWindow(every: ${__interval}, fn: mean)"
+        "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nfrom(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"pv_power_w\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> set(key: \"_field\", value: \"Сонячні панелі\") |> aggregateWindow(every: 5m, fn: mean)"
       }]
     },
     {
@@ -66,22 +66,22 @@
         {
           "refId": "A",
           "datasource": "InfluxDB-BESS",
-          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nfrom(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"pv_power_w\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> set(key: \"_field\", value: \"Сонячні панелі\") |> aggregateWindow(every: ${__interval}, fn: mean)"
+          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nfrom(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"pv_power_w\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> set(key: \"_field\", value: \"Сонячні панелі\") |> aggregateWindow(every: 5m, fn: mean)"
         },
         {
           "refId": "B",
           "datasource": "InfluxDB-BESS",
-          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nfrom(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"battery_power_w\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> set(key: \"_field\", value: \"Батарея (+заряд/-розряд)\") |> aggregateWindow(every: ${__interval}, fn: mean)"
+          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nfrom(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"battery_power_w\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> set(key: \"_field\", value: \"Батарея (+заряд/-розряд)\") |> aggregateWindow(every: 5m, fn: mean)"
         },
         {
           "refId": "C",
           "datasource": "InfluxDB-BESS",
-          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nfrom(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"grid_power_w\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> set(key: \"_field\", value: \"Мережа (+купівля/-продаж)\") |> aggregateWindow(every: ${__interval}, fn: mean)"
+          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nfrom(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"grid_power_w\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> set(key: \"_field\", value: \"Мережа (+купівля/-продаж)\") |> aggregateWindow(every: 5m, fn: mean)"
         },
         {
           "refId": "D",
           "datasource": "InfluxDB-BESS",
-          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nfrom(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"house_load_w\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> set(key: \"_field\", value: \"Навантаження будинку\") |> aggregateWindow(every: ${__interval}, fn: mean)"
+          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nfrom(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"house_load_w\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> set(key: \"_field\", value: \"Навантаження будинку\") |> aggregateWindow(every: 5m, fn: mean)"
         }
       ]
     },
@@ -102,7 +102,7 @@
       "targets": [{
         "refId": "A",
         "datasource": "InfluxDB-BESS",
-        "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nfrom(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"battery_temp_c\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> set(key: \"_field\", value: \"Температура батареї\") |> aggregateWindow(every: ${__interval}, fn: mean)"
+        "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nfrom(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"battery_temp_c\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> set(key: \"_field\", value: \"Температура батареї\") |> aggregateWindow(every: 5m, fn: mean)"
       }]
     },
     {
@@ -115,7 +115,7 @@
       "targets": [{
         "refId": "A",
         "datasource": "InfluxDB-BESS",
-        "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nfrom(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"grid_voltage_v\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> set(key: \"_field\", value: \"Напруга мережі\") |> aggregateWindow(every: ${__interval}, fn: mean)"
+        "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nfrom(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"grid_voltage_v\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> set(key: \"_field\", value: \"Напруга мережі\") |> aggregateWindow(every: 5m, fn: mean)"
       }]
     },
     {
@@ -207,5 +207,5 @@
   "timezone": "browser",
   "title": "BESS – Огляд системи",
   "uid": "bess-overview-v1",
-  "version": 6
+  "version": 7
 }
