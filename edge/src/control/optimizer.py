@@ -107,6 +107,12 @@ class BESSOptimizer:
         p_dis_max = cfg.battery_discharge_kw_max
         eta_c = cfg.charge_efficiency
         eta_d = cfg.discharge_efficiency
+        # PuLP's LpVariable doesn't support LpVariable / float (only
+        # float / int * LpVariable style scaling), so divisions by a
+        # round-trip efficiency are expressed as multiplication by the
+        # reciprocal instead.
+        inv_eta_c = 1.0 / eta_c
+        inv_eta_d = 1.0 / eta_d
 
         prob = pulp.LpProblem("BESS_DAM", pulp.LpMaximize)
 
@@ -117,17 +123,17 @@ class BESSOptimizer:
 
         # Revenue = sell revenue − buy cost (all in UAH/h)
         revenue = pulp.lpSum(
-            prices[h] / 1000.0 * (p_dis[h] * eta_d - p_chg[h] / eta_c)
+            prices[h] / 1000.0 * (p_dis[h] * eta_d - p_chg[h] * inv_eta_c)
             for h in range(24)
         )
         prob += revenue
 
         # SoC dynamics (initial SoC)
         soc_init = soc0 / 100.0 * cap
-        prob += soc[0] == soc_init + eta_c * p_chg[0] - p_dis[0] / eta_d
+        prob += soc[0] == soc_init + eta_c * p_chg[0] - p_dis[0] * inv_eta_d
 
         for h in range(1, 24):
-            prob += soc[h] == soc[h-1] + eta_c * p_chg[h] - p_dis[h] / eta_d
+            prob += soc[h] == soc[h-1] + eta_c * p_chg[h] - p_dis[h] * inv_eta_d
 
         # Mutual exclusion and power limits
         M = max(p_chg_max, p_dis_max) + 1
