@@ -275,6 +275,62 @@ class TestSQLiteStore(unittest.TestCase):
         self.assertIn("telemetry_rows", stats)
         self.assertGreater(stats["telemetry_rows"], 0)
 
+    def test_save_and_read_dam_prices(self):
+        prices = [1000.0 + h * 10 for h in range(24)]
+        self.store.save_dam_prices("2026-09-16", prices, "oree")
+        curves = self.store.get_real_price_history(max_days=14)
+        self.assertEqual(len(curves), 1)
+        self.assertEqual(curves[0], prices)
+
+    def test_dam_price_upsert_overwrites(self):
+        self.store.save_dam_prices("2026-09-16", [1.0] * 24, "oree")
+        self.store.save_dam_prices("2026-09-16", [2.0] * 24, "entsoe")
+        curves = self.store.get_real_price_history(max_days=14)
+        self.assertEqual(len(curves), 1)
+        self.assertEqual(curves[0], [2.0] * 24)
+
+    def test_static_source_excluded_from_history(self):
+        self.store.save_dam_prices("2026-09-16", [1.0] * 24, "static")
+        curves = self.store.get_real_price_history(max_days=14)
+        self.assertEqual(curves, [])
+
+
+class TestDAMClientHistoryFallback(unittest.IsolatedAsyncioTestCase):
+    """The fallback chain should prefer real cached history over the
+    hardcoded static matrix once any real data has been observed."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self.store = SQLiteStore(os.path.join(self._tmpdir, "test_edge.db"))
+        self.store.open()
+
+    def tearDown(self):
+        self.store.close()
+
+    async def test_falls_back_to_real_history_not_static(self):
+        from src.market_data.dam_client import DAMClient
+
+        self.store.save_dam_prices("2026-09-10", [2000.0] * 24, "oree")
+        self.store.save_dam_prices("2026-09-11", [4000.0] * 24, "cloud")
+
+        client = DAMClient(store=self.store)
+        with patch.object(DAMClient, "_fetch_oree", new=AsyncMock(return_value=None)), \
+             patch.object(DAMClient, "_fetch_entsoe", new=AsyncMock(return_value=None)):
+            prices = await client.get_prices(date(2026, 9, 17))
+
+        self.assertEqual(prices, [3000.0] * 24)
+
+    async def test_cold_start_uses_static_fallback(self):
+        from src.market_data.dam_client import DAMClient
+
+        client = DAMClient(store=self.store)
+        with patch.object(DAMClient, "_fetch_oree", new=AsyncMock(return_value=None)), \
+             patch.object(DAMClient, "_fetch_entsoe", new=AsyncMock(return_value=None)):
+            prices = await client.get_prices(date(2026, 9, 17))
+
+        self.assertEqual(len(prices), 24)
+        self.assertTrue(all(p > 0 for p in prices))
+
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 

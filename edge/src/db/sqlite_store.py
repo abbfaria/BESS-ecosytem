@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -39,6 +40,20 @@ CREATE TABLE IF NOT EXISTS events (
     data_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events (ts DESC);
+
+-- Every DAM price curve this device has actually fetched (any source),
+-- used to build a real-data historical fallback instead of a hardcoded
+-- synthetic curve when today's live fetch fails.
+CREATE TABLE IF NOT EXISTS dam_prices (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    valid_date    TEXT    NOT NULL,
+    hour          INTEGER NOT NULL,
+    price_uah_mwh REAL    NOT NULL,
+    source        TEXT    NOT NULL,
+    stored_at     REAL    NOT NULL,
+    UNIQUE(valid_date, hour)
+);
+CREATE INDEX IF NOT EXISTS idx_dam_prices_date ON dam_prices (valid_date DESC);
 """
 
 _RETENTION_HOURS = 48
@@ -139,6 +154,43 @@ class SQLiteStore:
             }
             for r in rows
         ]
+
+    # ── DAM price history (for real-data fallback) ───────────────────────────────
+
+    def save_dam_prices(self, valid_date: str, prices: list[float], source: str) -> None:
+        """Cache a fetched 24h price curve. `source` is 'oree'/'entsoe'/'static'."""
+        now = time.time()
+        self._conn.executemany(
+            "INSERT INTO dam_prices (valid_date, hour, price_uah_mwh, source, stored_at)"
+            " VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT(valid_date, hour) DO UPDATE SET"
+            "   price_uah_mwh=excluded.price_uah_mwh,"
+            "   source=excluded.source,"
+            "   stored_at=excluded.stored_at",
+            [(valid_date, h, p, source, now) for h, p in enumerate(prices)],
+        )
+        cutoff = (date.fromisoformat(valid_date) - timedelta(days=60)).isoformat()
+        self._conn.execute("DELETE FROM dam_prices WHERE valid_date < ?", (cutoff,))
+
+    def get_real_price_history(self, max_days: int = 14) -> list[list[float]]:
+        """Return up to `max_days` most recent *real* (non-static) 24h curves,
+        most recent first — used to build a data-driven fallback curve."""
+        cur = self._conn.execute(
+            "SELECT DISTINCT valid_date FROM dam_prices"
+            " WHERE source != 'static' ORDER BY valid_date DESC LIMIT ?",
+            (max_days,),
+        )
+        dates = [r[0] for r in cur.fetchall()]
+        curves = []
+        for d in dates:
+            rows = self._conn.execute(
+                "SELECT hour, price_uah_mwh FROM dam_prices"
+                " WHERE valid_date = ? AND source != 'static' ORDER BY hour ASC",
+                (d,),
+            ).fetchall()
+            if len(rows) == 24:
+                curves.append([p for _, p in rows])
+        return curves
 
     # ── Maintenance ───────────────────────────────────────────────────────────
 

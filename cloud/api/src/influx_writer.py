@@ -82,12 +82,63 @@ class InfluxWriter:
                 .field("grid_voltage_v",     float(data.get("grid_voltage_v", 0)))
                 .field("grid_frequency_hz",  float(data.get("grid_frequency_hz", 50)))
                 .field("inverter_temp_c",    float(data.get("inverter_temp_c", 0)))
+                .field("revenue_uah",        float(data.get("revenue_uah", 0)))
                 .field("fault_code",         int(data.get("fault_code", 0)))
                 .time(data.get("ts"), WritePrecision.NS)
             )
             await self._write.write(bucket=self._bucket, org=self._org, record=p)
         except Exception as exc:
             log.error("InfluxDB write_telemetry error", exc=str(exc))
+
+    async def write_schedule(self, device_id: str, data: dict) -> None:
+        """Store the edge's planned 24h dispatch schedule — one point per
+        hour, timestamped at that hour's actual UTC start, so it can be
+        queried by time range like any other series (e.g. "tomorrow's
+        expected revenue")."""
+        if not self._ok:
+            return
+        try:
+            valid_date = data.get("valid_date")
+            if not valid_date:
+                return
+            day = datetime.fromisoformat(valid_date).replace(tzinfo=timezone.utc)
+            points = []
+            for slot in data.get("slots", []):
+                hour = int(slot.get("hour", 0))
+                ts = day.replace(hour=hour, minute=0, second=0, microsecond=0)
+                points.append(
+                    Point("schedule")
+                    .tag("device_id", device_id)
+                    .tag("mode", slot.get("mode", "SOLAR_PRIORITY"))
+                    .field("price_uah_mwh",       float(slot.get("price_uah_mwh", 0)))
+                    .field("expected_revenue_uah", float(slot.get("expected_revenue_uah", 0)))
+                    .time(ts, WritePrecision.NS)
+                )
+            if points:
+                await self._write.write(bucket=self._bucket, org=self._org, record=points)
+        except Exception as exc:
+            log.error("InfluxDB write_schedule error", exc=str(exc))
+
+    async def write_market_price(self, device_id: str, valid_date: str,
+                                  prices: list[float], source: str) -> None:
+        """Store a raw fetched DAM price curve (independent of the
+        optimizer's schedule) — lets Grafana show the real market price
+        curve even before/without an optimized dispatch plan."""
+        if not self._ok:
+            return
+        try:
+            day = datetime.fromisoformat(valid_date).replace(tzinfo=timezone.utc)
+            points = [
+                Point("market_price")
+                .tag("device_id", device_id)
+                .tag("source", source)
+                .field("price_uah_mwh", float(p))
+                .time(day.replace(hour=h, minute=0, second=0, microsecond=0), WritePrecision.NS)
+                for h, p in enumerate(prices)
+            ]
+            await self._write.write(bucket=self._bucket, org=self._org, record=points)
+        except Exception as exc:
+            log.error("InfluxDB write_market_price error", exc=str(exc))
 
     async def write_status(self, device_id: str, data: dict) -> None:
         if not self._ok:

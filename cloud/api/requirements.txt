@@ -18,3 +18,7 @@ structlog==24.1.0
 
 # HTTP
 aiohttp==3.9.5
+
+# Headless-browser fetch of oree.com.ua (real Ukrainian DAM prices — the
+# site's data table is JS-loaded and blocks plain scripted requests)
+playwright==1.47.0

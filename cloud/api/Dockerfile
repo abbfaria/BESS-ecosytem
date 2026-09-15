@@ -9,6 +9,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
+# Chromium for market_fetcher.py's oree.com.ua scrape. --with-deps pulls in
+# the OS-level libraries Chromium needs on this slim base image.
+RUN playwright install --with-deps chromium
+
 COPY . .
 
 EXPOSE 8080

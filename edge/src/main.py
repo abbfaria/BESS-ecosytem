@@ -62,10 +62,10 @@ class EdgeOrchestrator:
     def __init__(self) -> None:
         # Components
         self._emulator   = BESSEmulator(EmulatorConfig(device_id=DEVICE_ID))
-        self._dam        = DAMClient(entsoe_token=ENTSOE_TOKEN)
+        self._store      = SQLiteStore(DATA_DIR / "edge.db")
+        self._dam        = DAMClient(entsoe_token=ENTSOE_TOKEN, store=self._store)
         self._optimizer  = BESSOptimizer(OptimizerConfig())
         self._fallback   = FallbackController(DATA_DIR / "last_schedule.json")
-        self._store      = SQLiteStore(DATA_DIR / "edge.db")
         self._buffer     = MQTTBuffer(DATA_DIR / "mqtt_buffer.db")
 
         mqtt_cfg         = MQTTClientConfig()
@@ -117,6 +117,16 @@ class EdgeOrchestrator:
         while self._running:
             try:
                 snapshot = await self._emulator.tick()
+
+                # Realized revenue for this interval: the DAM price actually
+                # scheduled for the current hour, applied to the energy
+                # actually exchanged with the grid (not the battery — PV-fed
+                # charging isn't a grid cost). + grid_power_w = import (cost),
+                # − grid_power_w = export (revenue).
+                price = self._fallback.get_current_action().price_uah_mwh
+                energy_kwh = snapshot.grid_power_w * (TELEMETRY_INTERVAL_S / 3600.0) / 1000.0
+                snapshot.revenue_uah = round(-energy_kwh * price / 1000.0, 4)
+
                 snap_dict = snapshot.to_dict()
 
                 # Persist locally
@@ -312,6 +322,16 @@ class EdgeOrchestrator:
         prices = [p["price_uah_mwh"] for p in data.get("prices", [])]
         if len(prices) == 24:
             self._prices_today = prices
+            valid_date = data.get("valid_date") or (
+                datetime.now(timezone.utc) + timedelta(days=1)
+            ).date().isoformat()
+            # Real prices fetched by the cloud's headless-browser scraper
+            # (see cloud/api/src/market_fetcher.py) — cache for the
+            # DAMClient's history-based fallback.
+            try:
+                self._store.save_dam_prices(valid_date, prices, "cloud")
+            except Exception as exc:
+                log.warning("Failed to cache cloud-pushed prices", exc=str(exc))
             log.info("Market prices received from cloud", max=max(prices))
 
     # ── FastAPI local API ─────────────────────────────────────────────────────

@@ -68,6 +68,12 @@ class SensorSnapshot:
     total_grid_import_kwh: float = 0.0
     total_grid_export_kwh: float = 0.0
 
+    # Realized economics: money made/spent on the grid interaction during
+    # the interval ending at `ts`, using the DAM price actually in effect
+    # for the current hour (0.0 when no real price is known yet).
+    # + = revenue (net export), − = cost (net import).
+    revenue_uah:      float = 0.0
+
     # Fault bitmask (0 = healthy)
     fault_code:       int   = 0
 
@@ -94,5 +100,6 @@ class SensorSnapshot:
             "total_pv_energy_kwh":   self.total_pv_energy_kwh,
             "total_grid_import_kwh": self.total_grid_import_kwh,
             "total_grid_export_kwh": self.total_grid_export_kwh,
+            "revenue_uah":       self.revenue_uah,
             "fault_code":        self.fault_code,
         }

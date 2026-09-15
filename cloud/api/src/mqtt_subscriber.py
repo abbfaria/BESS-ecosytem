@@ -26,6 +26,7 @@ _TELEMETRY_RE = re.compile(r"^bess/([^/]+)/telemetry$")
 _STATUS_RE    = re.compile(r"^bess/([^/]+)/status$")
 _FAULT_RE     = re.compile(r"^bess/([^/]+)/fault$")
 _LWT_RE       = re.compile(r"^bess/([^/]+)/lwt$")
+_SCHEDULE_RE  = re.compile(r"^bess/([^/]+)/schedule$")
 
 TelemetryCallback = Callable[[str, dict], Awaitable[None]]
 
@@ -38,14 +39,17 @@ class MQTTSubscriber:
         on_telemetry: TelemetryCallback,
         on_status:    TelemetryCallback,
         on_fault:     TelemetryCallback,
+        on_schedule:  Optional[TelemetryCallback] = None,
     ) -> None:
         self._host         = host
         self._port         = port
         self._on_telemetry = on_telemetry
         self._on_status    = on_status
         self._on_fault     = on_fault
+        self._on_schedule  = on_schedule
         self._connected    = False
         self._running      = False
+        self._client        = None
         self._stats        = {"received": 0, "errors": 0, "devices": set()}
 
     async def run(self) -> None:
@@ -74,6 +78,7 @@ class MQTTSubscriber:
             identifier="cloud-api",
             keepalive=30,
         ) as client:
+            self._client    = client
             self._connected = True
             log.info("Cloud MQTT subscriber connected",
                      host=self._host, port=self._port)
@@ -84,11 +89,15 @@ class MQTTSubscriber:
             await client.subscribe("bess/+/fault",     qos=1)
             await client.subscribe("bess/+/lwt",       qos=1)
             await client.subscribe("bess/+/buffer_stats", qos=1)
+            await client.subscribe("bess/+/schedule",  qos=1)
 
-            async for message in client.messages:
-                if not self._running:
-                    break
-                await self._dispatch(str(message.topic), bytes(message.payload))
+            try:
+                async for message in client.messages:
+                    if not self._running:
+                        break
+                    await self._dispatch(str(message.topic), bytes(message.payload))
+            finally:
+                self._client = None
 
     async def _dispatch(self, topic: str, payload: bytes) -> None:
         try:
@@ -123,6 +132,26 @@ class MQTTSubscriber:
         if m:
             log.warning("LWT received — device offline", device_id=m.group(1))
             return
+
+        m = _SCHEDULE_RE.match(topic)
+        if m and self._on_schedule:
+            await self._on_schedule(m.group(1), data)
+            return
+
+    async def publish(self, topic: str, payload: str, qos: int = 1) -> bool:
+        """Publish a downlink (e.g. a fetched market price curve) to edge
+        devices. Best-effort: returns False (and logs) if not currently
+        connected, rather than raising — callers treat this as one signal
+        among several, not a hard dependency."""
+        if self._client is None:
+            log.warning("Cannot publish — MQTT subscriber not connected", topic=topic)
+            return False
+        try:
+            await self._client.publish(topic, payload=payload, qos=qos)
+            return True
+        except Exception as exc:
+            log.error("MQTT publish failed", topic=topic, exc=str(exc))
+            return False
 
     async def stop(self) -> None:
         self._running = False
