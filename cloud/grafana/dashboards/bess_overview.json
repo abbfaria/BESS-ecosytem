@@ -51,9 +51,8 @@
       "fieldConfig": { "defaults": { "unit": "watt", "color": { "fixedColor": "yellow", "mode": "fixed" } } },
       "targets": [{
         "refId": "A",
-        "legendFormat": "Сонячні панелі",
         "datasource": "InfluxDB-BESS",
-        "query": "from(bucket:\"telemetry\") |> range(start: -1h) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"pv_power_w\") |> drop(columns: [\"grid_status\", \"inverter_mode\"]) |> aggregateWindow(every: 1m, fn: mean)"
+        "query": "from(bucket:\"telemetry\") |> range(start: -1h) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"pv_power_w\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> set(key: \"_field\", value: \"Сонячні панелі\") |> aggregateWindow(every: 1m, fn: mean)"
       }]
     },
     {
@@ -65,24 +64,24 @@
       "fieldConfig": { "defaults": { "unit": "watt" } },
       "targets": [
         {
-          "refId": "A", "legendFormat": "Сонячні панелі",
+          "refId": "A",
           "datasource": "InfluxDB-BESS",
-          "query": "from(bucket:\"telemetry\") |> range(start: -1h) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"pv_power_w\") |> drop(columns: [\"grid_status\", \"inverter_mode\"]) |> aggregateWindow(every: 1m, fn: mean)"
+          "query": "from(bucket:\"telemetry\") |> range(start: -1h) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"pv_power_w\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> set(key: \"_field\", value: \"Сонячні панелі\") |> aggregateWindow(every: 1m, fn: mean)"
         },
         {
-          "refId": "B", "legendFormat": "Батарея (+заряд/-розряд)",
+          "refId": "B",
           "datasource": "InfluxDB-BESS",
-          "query": "from(bucket:\"telemetry\") |> range(start: -1h) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"battery_power_w\") |> drop(columns: [\"grid_status\", \"inverter_mode\"]) |> aggregateWindow(every: 1m, fn: mean)"
+          "query": "from(bucket:\"telemetry\") |> range(start: -1h) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"battery_power_w\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> set(key: \"_field\", value: \"Батарея (+заряд/-розряд)\") |> aggregateWindow(every: 1m, fn: mean)"
         },
         {
-          "refId": "C", "legendFormat": "Мережа (+купівля/-продаж)",
+          "refId": "C",
           "datasource": "InfluxDB-BESS",
-          "query": "from(bucket:\"telemetry\") |> range(start: -1h) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"grid_power_w\") |> drop(columns: [\"grid_status\", \"inverter_mode\"]) |> aggregateWindow(every: 1m, fn: mean)"
+          "query": "from(bucket:\"telemetry\") |> range(start: -1h) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"grid_power_w\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> set(key: \"_field\", value: \"Мережа (+купівля/-продаж)\") |> aggregateWindow(every: 1m, fn: mean)"
         },
         {
-          "refId": "D", "legendFormat": "Навантаження будинку",
+          "refId": "D",
           "datasource": "InfluxDB-BESS",
-          "query": "from(bucket:\"telemetry\") |> range(start: -1h) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"house_load_w\") |> drop(columns: [\"grid_status\", \"inverter_mode\"]) |> aggregateWindow(every: 1m, fn: mean)"
+          "query": "from(bucket:\"telemetry\") |> range(start: -1h) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"house_load_w\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> set(key: \"_field\", value: \"Навантаження будинку\") |> aggregateWindow(every: 1m, fn: mean)"
         }
       ]
     },
@@ -102,9 +101,8 @@
       },
       "targets": [{
         "refId": "A",
-        "legendFormat": "Температура батареї",
         "datasource": "InfluxDB-BESS",
-        "query": "from(bucket:\"telemetry\") |> range(start: -1h) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"battery_temp_c\") |> drop(columns: [\"grid_status\", \"inverter_mode\"]) |> aggregateWindow(every: 1m, fn: mean)"
+        "query": "from(bucket:\"telemetry\") |> range(start: -1h) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"battery_temp_c\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> set(key: \"_field\", value: \"Температура батареї\") |> aggregateWindow(every: 1m, fn: mean)"
       }]
     },
     {
@@ -116,9 +114,8 @@
       "fieldConfig": { "defaults": { "unit": "volt", "min": 195, "max": 253 } },
       "targets": [{
         "refId": "A",
-        "legendFormat": "Напруга мережі",
         "datasource": "InfluxDB-BESS",
-        "query": "from(bucket:\"telemetry\") |> range(start: -1h) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"grid_voltage_v\") |> drop(columns: [\"grid_status\", \"inverter_mode\"]) |> aggregateWindow(every: 1m, fn: mean)"
+        "query": "from(bucket:\"telemetry\") |> range(start: -1h) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"grid_voltage_v\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> set(key: \"_field\", value: \"Напруга мережі\") |> aggregateWindow(every: 1m, fn: mean)"
       }]
     },
     {
@@ -198,9 +195,8 @@
       "fieldConfig": { "defaults": { "unit": "none" } },
       "targets": [{
         "refId": "A",
-        "legendFormat": "Ціна РДН",
         "datasource": "InfluxDB-BESS",
-        "query": "import \"date\"\nstart = date.add(d: -1d, to: date.truncate(t: now(), unit: 1d))\nstop  = date.add(d: 2d, to: date.truncate(t: now(), unit: 1d))\nfrom(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"market_price\" and r._field == \"price_uah_mwh\")"
+        "query": "import \"date\"\nstart = date.add(d: -1d, to: date.truncate(t: now(), unit: 1d))\nstop  = date.add(d: 2d, to: date.truncate(t: now(), unit: 1d))\nfrom(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"market_price\" and r._field == \"price_uah_mwh\") |> drop(columns: [\"device_id\", \"source\"]) |> set(key: \"_field\", value: \"Ціна РДН\")"
       }]
     }
   ],
@@ -211,5 +207,5 @@
   "timezone": "browser",
   "title": "BESS – Огляд системи",
   "uid": "bess-overview-v1",
-  "version": 3
+  "version": 4
 }
