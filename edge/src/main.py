@@ -80,10 +80,16 @@ class EdgeOrchestrator:
         self._mqtt: Optional[EdgeMQTTClient] = None
         self._start_time = time.monotonic()
         self._running    = False
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._prices_today: Optional[list[float]] = None
 
     async def run(self) -> None:
         self._running = True
+        # paho-mqtt's on_message callback (and therefore _apply_market_push)
+        # runs on paho's own network thread (client.loop_start()), not this
+        # event loop's thread — capture the loop here so that thread can
+        # safely hand work back via run_coroutine_threadsafe.
+        self._loop = asyncio.get_running_loop()
         self._store.open()
         self._buffer.open()
 
@@ -202,51 +208,62 @@ class EdgeOrchestrator:
                 tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).date()
                 prices   = await self._dam.get_prices(for_date=tomorrow)
                 self._prices_today = prices
-
-                # Fetch current SoC from latest telemetry
-                latest = self._store.get_latest_telemetry(1)
-                soc = latest[0].get("battery_soc_pct", 50.0) if latest else 50.0
-
-                # Optimise
-                actions = self._optimizer.optimize(prices, soc)
-                self._fallback.save_schedule(actions, tomorrow.isoformat())
-
-                # Publish schedule to cloud
-                schedule_payload = {
-                    "schedule_id": f"{DEVICE_ID}-{tomorrow.isoformat()}",
-                    "generated_ts": datetime.now(timezone.utc).isoformat(),
-                    "valid_date": tomorrow.isoformat(),
-                    "device_id": DEVICE_ID,
-                    "slots": [
-                        {
-                            "hour":             a.hour,
-                            "mode":             a.mode,
-                            "charge_power_pct": a.charge_pct,
-                            "discharge_power_pct": a.discharge_pct,
-                            "price_uah_mwh":    a.price_uah_mwh,
-                            "expected_revenue_uah": a.expected_revenue,
-                        }
-                        for a in actions
-                    ],
-                    "total_expected_revenue_uah": round(
-                        sum(a.expected_revenue for a in actions), 2
-                    ),
-                    "optimizer_version": "milp-v1" if True else "greedy-v1",
-                }
-                await self._mqtt.publish(
-                    _topic("schedule"),
-                    json.dumps(schedule_payload, default=str),
-                    qos=1,
-                )
-                self._store.log_event(
-                    "SCHEDULE_GENERATED",
-                    f"24h schedule for {tomorrow.isoformat()} published",
-                    data={"revenue_uah": schedule_payload["total_expected_revenue_uah"]},
-                )
+                await self._run_optimizer_and_publish(prices, tomorrow.isoformat())
 
             except Exception as exc:
                 log.error("Market loop error", exc=str(exc))
                 await asyncio.sleep(300)
+
+    async def _run_optimizer_and_publish(
+        self, prices: list[float], valid_date: str
+    ) -> None:
+        """Compute a schedule from `prices` and apply/publish it immediately.
+
+        Shared by the daily timer (_market_loop) and by _apply_market_push,
+        so that real prices act on the schedule as soon as they actually
+        arrive — not only when the fixed 14:00 UTC window happens to land
+        while everything is connected. A container restart (which resets
+        _market_loop's timer) or a missed window no longer strands the
+        device on price_uah_mwh=0.0 fallback behaviour for a whole day;
+        any later real price push self-heals it immediately.
+        """
+        latest = self._store.get_latest_telemetry(1)
+        soc = latest[0].get("battery_soc_pct", 50.0) if latest else 50.0
+
+        actions = self._optimizer.optimize(prices, soc)
+        self._fallback.save_schedule(actions, valid_date)
+
+        schedule_payload = {
+            "schedule_id": f"{DEVICE_ID}-{valid_date}",
+            "generated_ts": datetime.now(timezone.utc).isoformat(),
+            "valid_date": valid_date,
+            "device_id": DEVICE_ID,
+            "slots": [
+                {
+                    "hour":             a.hour,
+                    "mode":             a.mode,
+                    "charge_power_pct": a.charge_pct,
+                    "discharge_power_pct": a.discharge_pct,
+                    "price_uah_mwh":    a.price_uah_mwh,
+                    "expected_revenue_uah": a.expected_revenue,
+                }
+                for a in actions
+            ],
+            "total_expected_revenue_uah": round(
+                sum(a.expected_revenue for a in actions), 2
+            ),
+            "optimizer_version": "milp-v1" if True else "greedy-v1",
+        }
+        await self._mqtt.publish(
+            _topic("schedule"),
+            json.dumps(schedule_payload, default=str),
+            qos=1,
+        )
+        self._store.log_event(
+            "SCHEDULE_GENERATED",
+            f"24h schedule for {valid_date} published",
+            data={"revenue_uah": schedule_payload["total_expected_revenue_uah"]},
+        )
 
     # ── Status loop ────────────────────────────────────────────────────────────
 
@@ -333,6 +350,21 @@ class EdgeOrchestrator:
             except Exception as exc:
                 log.warning("Failed to cache cloud-pushed prices", exc=str(exc))
             log.info("Market prices received from cloud", max=max(prices))
+            # Act on real data the moment it arrives, rather than waiting
+            # for _market_loop's own fixed daily window — that window
+            # resets on every container restart and is otherwise skipped
+            # for the rest of the day if missed, which is exactly what
+            # repeated network outages have been causing in practice.
+            #
+            # This callback runs on paho-mqtt's own network thread
+            # (client.loop_start()), not the asyncio event loop thread, so
+            # scheduling the coroutine must go through
+            # run_coroutine_threadsafe rather than create_task.
+            if self._loop is not None:
+                asyncio.run_coroutine_threadsafe(
+                    self._run_optimizer_and_publish(prices, valid_date),
+                    self._loop,
+                )
 
     # ── FastAPI local API ─────────────────────────────────────────────────────
 
