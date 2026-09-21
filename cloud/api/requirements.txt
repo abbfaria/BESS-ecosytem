@@ -22,3 +22,7 @@ aiohttp==3.9.5
 # Headless-browser fetch of oree.com.ua (real Ukrainian DAM prices — the
 # site's data table is JS-loaded and blocks plain scripted requests)
 playwright==1.47.0
+
+# MILP optimization — reused from edge_src for the startup history backfill
+# (src/history.py), same version as edge/requirements.txt
+PuLP==2.8.0

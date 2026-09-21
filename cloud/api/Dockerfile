@@ -6,14 +6,33 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY requirements.txt .
+# CBC solver for PuLP (used by edge_src/control/optimizer.py's real MILP
+# dispatch, reused here by the startup history backfill — see
+# src/history.py). PuLP shells out to the `cbc` binary; it doesn't link
+# against libCbc, so no -dev package is needed.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        coinor-cbc \
+        gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build context is the repo root (see cloud/docker-compose.yml) so both
+# source trees are reachable.
+COPY cloud/api/requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
 # Chromium for market_fetcher.py's oree.com.ua scrape. --with-deps pulls in
 # the OS-level libraries Chromium needs on this slim base image.
 RUN playwright install --with-deps chromium
 
-COPY . .
+COPY cloud/api/src ./src
+
+# The real edge optimizer/emulator/fallback-price modules, reused as-is by
+# the history backfill (src/history.py) so backfilled data is produced by
+# the exact same code as live operation — not a second implementation that
+# can silently drift from it. Copied wholesale (not cherry-picked) so their
+# existing internal relative imports (`from ..utils...`, etc.) keep working
+# unmodified.
+COPY edge/src ./edge_src
 
 EXPOSE 8080
 

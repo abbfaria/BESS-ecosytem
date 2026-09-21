@@ -93,16 +93,38 @@ class BESSEmulator:
             self._override_until = time.monotonic() + duration_min * 60
         log.info("Mode set", mode=mode, charge=charge_pct, discharge=discharge_pct)
 
+    def force_mode(self, mode: str, charge_pct: float = 0.0,
+                    discharge_pct: float = 0.0) -> None:
+        """Set dispatch mode directly, without the time.monotonic()-based
+        override-expiry timer `set_mode()` uses — that timer is a live-only
+        command-timeout safety feature and is meaningless during
+        deterministic historical replay (see `tick(as_of=..., dt_s=...)`)."""
+        self._mode           = mode
+        self._charge_pct     = max(0.0, min(100.0, charge_pct))
+        self._discharge_pct  = max(0.0, min(100.0, discharge_pct))
+        self._override_until = None
+
     # ── Snapshot generation ──────────────────────────────────────────────
 
-    async def tick(self) -> SensorSnapshot:
-        """Advance simulation by one time step and return a snapshot."""
-        now        = time.monotonic()
-        dt_s       = now - self._last_tick_time
-        dt_s       = max(0.1, min(dt_s, 60.0))   # clamp
-        self._last_tick_time = now
+    async def tick(
+        self,
+        as_of: Optional[datetime] = None,
+        dt_s: Optional[float] = None,
+    ) -> SensorSnapshot:
+        """Advance simulation by one time step and return a snapshot.
 
-        utc_now = datetime.now(timezone.utc)
+        `as_of`/`dt_s` let a caller deterministically replay the model for
+        an arbitrary historical instant (used by the cloud's history
+        backfill) instead of always stepping from the real wall clock —
+        the live sensor loop never passes them, so its behavior is
+        unchanged.
+        """
+        if dt_s is None:
+            now  = time.monotonic()
+            dt_s = max(0.1, min(now - self._last_tick_time, 60.0))   # clamp
+            self._last_tick_time = now
+
+        utc_now = as_of or datetime.now(timezone.utc)
 
         # 1. Evolve environment
         self._evolve_weather(dt_s)

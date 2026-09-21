@@ -88,8 +88,13 @@ services:
   # ── Cloud API ────────────────────────────────────────────────────────────────
   cloud-api:
     build:
-      context: ./api
-      dockerfile: Dockerfile
+      # Repo root, not ./api: the image also needs edge/src (optimizer,
+      # emulator, fallback price data) to drive the startup history
+      # backfill with the exact same physics/dispatch code edge itself
+      # runs, instead of a second, drift-prone reimplementation. See
+      # cloud/api/src/history.py.
+      context: ..
+      dockerfile: cloud/api/Dockerfile
     container_name: bess-cloud-api
     restart: unless-stopped
     depends_on:
