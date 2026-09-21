@@ -26,6 +26,7 @@ from .market_fetcher import fetch_dam_prices
 from .mqtt_subscriber import MQTTSubscriber
 from .router import create_router
 from .logging_config import get_logger
+from .history import ensure_history
 
 log = get_logger(__name__)
 
@@ -52,6 +53,17 @@ MARKET_FETCH_RETRY_S    = 900  # retry cadence while today's prices aren't publi
 _writer:     InfluxWriter    = None   # type: ignore
 _subscriber: MQTTSubscriber  = None   # type: ignore
 _market_task: "asyncio.Task | None" = None
+
+
+async def _backfill_history_task() -> None:
+    """One-shot at startup: fill any gaps in the last BACKFILL_DAYS of
+    history and ensure today/tomorrow's forecast schedule exists. See
+    history.py."""
+    for device_id in MARKET_PUSH_DEVICE_IDS:
+        try:
+            await ensure_history(_writer, INFLUXDB_BUCKET, device_id)
+        except Exception as exc:
+            log.error("History backfill failed", device_id=device_id, exc=str(exc))
 
 
 async def _market_fetch_loop() -> None:
@@ -104,6 +116,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         bucket=INFLUXDB_BUCKET,
     )
     await _writer.connect()
+
+    # Guarantee Grafana has a full picture soon after this container is up
+    # — a continuous history for lookback panels (esp. the 30-day payback
+    # panel) and a today/tomorrow forecast — instead of depending on
+    # wall-clock time to pass with the stack continuously running. See
+    # history.py for the full rationale. Backfilling ~35 days (real price
+    # fetches included) can take minutes, so this runs in the background
+    # rather than blocking startup/the health check, same as
+    # _market_fetch_loop below.
+    asyncio.create_task(_backfill_history_task(), name="history-backfill")
 
     _subscriber = MQTTSubscriber(
         host=MQTT_BROKER_HOST,

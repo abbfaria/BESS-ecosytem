@@ -19,7 +19,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -32,6 +32,7 @@ from src.market_data.fallback_data import get_fallback_prices, get_fallback_pric
 from src.mqtt.buffer import MQTTBuffer
 from src.control.optimizer import BESSOptimizer, OptimizerConfig
 from src.control.fallback import FallbackController
+from src.control.economics import compute_revenue_uah
 from src.db.sqlite_store import SQLiteStore
 
 
@@ -71,6 +72,33 @@ class TestBESSEmulator(unittest.IsolatedAsyncioTestCase):
         self.em.set_mode("GRID_CHARGE", charge_pct=80.0, duration_min=120)
         snap = await self.em.tick()
         self.assertEqual(snap.inverter_mode, "GRID_CHARGE")
+
+    async def test_force_mode_sets_mode_without_override_timer(self):
+        """force_mode() is the historical-replay entry point — it must not
+        depend on time.monotonic()-based override expiry like set_mode()."""
+        self.em.force_mode("DISCHARGE_SELL", discharge_pct=60.0)
+        snap = await self.em.tick(as_of=datetime(2026, 6, 1, 12, tzinfo=timezone.utc),
+                                   dt_s=300.0)
+        self.assertEqual(snap.inverter_mode, "DISCHARGE_SELL")
+
+    async def test_tick_as_of_is_deterministic_regardless_of_wall_clock(self):
+        """Two ticks for the *same* as_of/dt_s should describe the same
+        simulated instant (noon, full PV) regardless of when the test
+        actually runs — this is what makes historical backfill possible."""
+        noon = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+        self.em.force_mode("SOLAR_PRIORITY")
+        snap = await self.em.tick(as_of=noon, dt_s=300.0)
+        self.assertGreater(snap.pv_power_w, 0.0, "should be full daylight at noon")
+        self.assertEqual(snap.ts, noon)
+
+    async def test_tick_as_of_replays_historical_dates(self):
+        """Stepping as_of backwards in time must not raise or misbehave —
+        the backfill drives the emulator through many past days in a
+        single long-lived instance."""
+        past = datetime(2026, 1, 1, 6, tzinfo=timezone.utc)
+        self.em.force_mode("SOLAR_PRIORITY")
+        snap = await self.em.tick(as_of=past, dt_s=300.0)
+        self.assertEqual(snap.ts, past)
 
     def test_snapshot_to_dict(self):
         snap = SensorSnapshot(
@@ -164,6 +192,29 @@ class TestMQTTBuffer(unittest.IsolatedAsyncioTestCase):
         self.assertIn("enqueued", stats)
         self.assertIn("pending", stats)
         self.assertEqual(stats["pending"], 1)
+
+
+# ── Economics Tests ────────────────────────────────────────────────────────────
+
+class TestEconomics(unittest.TestCase):
+    """The single revenue formula shared by the live sensor loop
+    (EdgeOrchestrator._sensor_loop) and the cloud history backfill
+    (cloud/api/src/history.py) — must stay identical between the two."""
+
+    def test_import_costs_money(self):
+        # +grid_power_w = import from the grid = a cost = negative revenue
+        rev = compute_revenue_uah(grid_power_w=1000.0, interval_s=3600, price_uah_mwh=5000.0)
+        self.assertLess(rev, 0.0)
+        self.assertAlmostEqual(rev, -5.0, places=2)   # 1 kWh @ 5000 UAH/MWh
+
+    def test_export_earns_money(self):
+        # -grid_power_w = export to the grid = revenue
+        rev = compute_revenue_uah(grid_power_w=-2000.0, interval_s=1800, price_uah_mwh=4000.0)
+        self.assertGreater(rev, 0.0)
+        self.assertAlmostEqual(rev, 4.0, places=2)   # 1 kWh @ 4000 UAH/MWh
+
+    def test_no_grid_flow_is_zero_revenue(self):
+        self.assertEqual(compute_revenue_uah(0.0, 300, 5000.0), 0.0)
 
 
 # ── Optimizer Tests ────────────────────────────────────────────────────────────

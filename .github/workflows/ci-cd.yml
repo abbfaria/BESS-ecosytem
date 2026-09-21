@@ -30,6 +30,14 @@ jobs:
           rsync -a --delete \
             --exclude '.env' --exclude 'certs/' --exclude 'data/' --exclude '__pycache__/' \
             cloud/ "$HOME/Code/bess-ecosystem/cloud/"
+          # cloud-api's image build (context = repo root, see
+          # cloud/docker-compose.yml) also needs a current copy of
+          # edge/src — it reuses the real optimizer/emulator for the
+          # startup history backfill (cloud/api/src/history.py) instead
+          # of a second, drift-prone reimplementation. Source-only, never
+          # deployed as a running service on this VM.
+          rsync -a --delete --exclude '__pycache__/' \
+            edge/src/ "$HOME/Code/bess-ecosystem/edge/src/"
       - name: Build and deploy
         run: |
           cd "$HOME/Code/bess-ecosystem/cloud"

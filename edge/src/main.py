@@ -40,6 +40,7 @@ from .mqtt.client import EdgeMQTTClient, MQTTClientConfig
 from .mqtt.buffer import MQTTBuffer
 from .control.optimizer import BESSOptimizer, OptimizerConfig
 from .control.fallback import FallbackController
+from .control.economics import compute_revenue_uah
 from .db.sqlite_store import SQLiteStore
 from .utils.logging_config import get_logger
 
@@ -130,8 +131,9 @@ class EdgeOrchestrator:
                 # charging isn't a grid cost). + grid_power_w = import (cost),
                 # − grid_power_w = export (revenue).
                 price = self._fallback.get_current_action().price_uah_mwh
-                energy_kwh = snapshot.grid_power_w * (TELEMETRY_INTERVAL_S / 3600.0) / 1000.0
-                snapshot.revenue_uah = round(-energy_kwh * price / 1000.0, 4)
+                snapshot.revenue_uah = compute_revenue_uah(
+                    snapshot.grid_power_w, TELEMETRY_INTERVAL_S, price
+                )
 
                 snap_dict = snapshot.to_dict()
 
