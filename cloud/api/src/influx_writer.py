@@ -110,7 +110,23 @@ class InfluxWriter:
         """Store the edge's planned 24h dispatch schedule — one point per
         hour, timestamped at that hour's actual UTC start, so it can be
         queried by time range like any other series (e.g. "tomorrow's
-        expected revenue")."""
+        expected revenue").
+
+        `mode` is a *field*, not a tag. It was originally a tag, which
+        seemed harmless (it's a fixed small set of string values) but
+        broke exactly the "same hour, recomputed" case this measurement
+        exists for: an InfluxDB point's identity is its measurement + full
+        tag set + timestamp, so a later write for the same hour with a
+        *different* mode (e.g. the cloud's forward-projection schedules a
+        day as SOLAR_PRIORITY before real prices are known, then the edge
+        recomputes it as DISCHARGE_SELL once they arrive) doesn't overwrite
+        the earlier point — it creates a second, parallel series at the
+        same timestamp, and both then get summed by any query that
+        aggregates expected_revenue_uah, double-counting the hour. Fields
+        don't participate in a point's identity, so a mode change now
+        correctly overwrites in place like price_uah_mwh and
+        expected_revenue_uah already did.
+        """
         if not self._ok:
             return
         try:
@@ -125,7 +141,7 @@ class InfluxWriter:
                 points.append(
                     Point("schedule")
                     .tag("device_id", device_id)
-                    .tag("mode", slot.get("mode", "SOLAR_PRIORITY"))
+                    .field("mode",                 str(slot.get("mode", "SOLAR_PRIORITY")))
                     .field("price_uah_mwh",       float(slot.get("price_uah_mwh", 0)))
                     .field("expected_revenue_uah", float(slot.get("expected_revenue_uah", 0)))
                     .time(ts, WritePrecision.NS)
