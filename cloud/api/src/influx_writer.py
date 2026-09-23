@@ -61,34 +61,50 @@ class InfluxWriter:
 
     # ── Write helpers ──────────────────────────────────────────────────────────
 
+    def _telemetry_point(self, measurement: str, device_id: str, data: dict) -> "Point":
+        return (
+            Point(measurement)
+            .tag("device_id", device_id)
+            .tag("grid_status",   data.get("grid_status", "CONNECTED"))
+            .tag("inverter_mode", data.get("inverter_mode", "SOLAR_PRIORITY"))
+            .field("pv_power_w",        float(data.get("pv_power_w", 0)))
+            .field("wind_power_w",       float(data.get("wind_power_w", 0)))
+            .field("battery_power_w",    float(data.get("battery_power_w", 0)))
+            .field("grid_power_w",       float(data.get("grid_power_w", 0)))
+            .field("house_load_w",       float(data.get("house_load_w", 0)))
+            .field("battery_soc_pct",    float(data.get("battery_soc_pct", 0)))
+            .field("battery_soh_pct",    float(data.get("battery_soh_pct", 100)))
+            .field("battery_temp_c",     float(data.get("battery_temp_c", 0)))
+            .field("battery_voltage_v",  float(data.get("battery_voltage_v", 0)))
+            .field("grid_voltage_v",     float(data.get("grid_voltage_v", 0)))
+            .field("grid_frequency_hz",  float(data.get("grid_frequency_hz", 50)))
+            .field("inverter_temp_c",    float(data.get("inverter_temp_c", 0)))
+            .field("revenue_uah",        float(data.get("revenue_uah", 0)))
+            .field("fault_code",         int(data.get("fault_code", 0)))
+            .time(data.get("ts"), WritePrecision.NS)
+        )
+
     async def write_telemetry(self, device_id: str, data: dict) -> None:
         if not self._ok:
             return
         try:
-            p = (
-                Point("telemetry")
-                .tag("device_id", device_id)
-                .tag("grid_status",   data.get("grid_status", "CONNECTED"))
-                .tag("inverter_mode", data.get("inverter_mode", "SOLAR_PRIORITY"))
-                .field("pv_power_w",        float(data.get("pv_power_w", 0)))
-                .field("wind_power_w",       float(data.get("wind_power_w", 0)))
-                .field("battery_power_w",    float(data.get("battery_power_w", 0)))
-                .field("grid_power_w",       float(data.get("grid_power_w", 0)))
-                .field("house_load_w",       float(data.get("house_load_w", 0)))
-                .field("battery_soc_pct",    float(data.get("battery_soc_pct", 0)))
-                .field("battery_soh_pct",    float(data.get("battery_soh_pct", 100)))
-                .field("battery_temp_c",     float(data.get("battery_temp_c", 0)))
-                .field("battery_voltage_v",  float(data.get("battery_voltage_v", 0)))
-                .field("grid_voltage_v",     float(data.get("grid_voltage_v", 0)))
-                .field("grid_frequency_hz",  float(data.get("grid_frequency_hz", 50)))
-                .field("inverter_temp_c",    float(data.get("inverter_temp_c", 0)))
-                .field("revenue_uah",        float(data.get("revenue_uah", 0)))
-                .field("fault_code",         int(data.get("fault_code", 0)))
-                .time(data.get("ts"), WritePrecision.NS)
-            )
+            p = self._telemetry_point("telemetry", device_id, data)
             await self._write.write(bucket=self._bucket, org=self._org, record=p)
         except Exception as exc:
             log.error("InfluxDB write_telemetry error", exc=str(exc))
+
+    async def write_telemetry_forecast(self, device_id: str, data: dict) -> None:
+        """Same schema as write_telemetry, written to a separate
+        `telemetry_forecast` measurement — a projection for a day that
+        hasn't happened yet (see cloud/api/src/history.py), never to be
+        confused with `telemetry`'s actual measurements even by accident."""
+        if not self._ok:
+            return
+        try:
+            p = self._telemetry_point("telemetry_forecast", device_id, data)
+            await self._write.write(bucket=self._bucket, org=self._org, record=p)
+        except Exception as exc:
+            log.error("InfluxDB write_telemetry_forecast error", exc=str(exc))
 
     async def write_schedule(self, device_id: str, data: dict) -> None:
         """Store the edge's planned 24h dispatch schedule — one point per
