@@ -279,7 +279,49 @@ class TestFallbackController(unittest.TestCase):
         ok = fc2.load_schedule()
         self.assertTrue(ok)
         self.assertEqual(fc2.loaded_date, "2024-07-15")
-        self.assertEqual(len(fc2._schedule), 24)
+        self.assertEqual(len(fc2._schedules["2024-07-15"]), 24)
+
+    def test_load_schedule_accepts_legacy_single_schedule_format(self):
+        """A device upgrading from a pre-fix image has last_schedule.json
+        in the old `{"valid_date":..., "slots":[...]}` shape on disk —
+        must still load, not be silently discarded."""
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            path = Path(f.name)
+        path.write_text(json.dumps({
+            "valid_date": "2024-07-15",
+            "slots": [{"hour": h, "mode": "SOLAR_PRIORITY",
+                       "charge_pct": 0.0, "discharge_pct": 0.0, "price_uah_mwh": 0.0}
+                      for h in range(24)],
+        }))
+        fc = FallbackController(path)
+        self.assertTrue(fc.load_schedule())
+        self.assertEqual(fc.loaded_date, "2024-07-15")
+
+    def test_tomorrows_schedule_does_not_evict_todays(self):
+        """The actual bug this design fixes: the cloud routinely pushes
+        tomorrow's real-price schedule during the afternoon, well before
+        today is over (see _apply_market_push in main.py). Saving it must
+        not make today's still-active schedule disappear."""
+        from src.control.optimizer import HourlyAction
+        from datetime import datetime, timezone, timedelta
+
+        fc = FallbackController(Path(tempfile.mktemp()))
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        today_actions = [HourlyAction(hour=h, mode="DISCHARGE_SELL", price_uah_mwh=12000.0)
+                          for h in range(24)]
+        fc.save_schedule(today_actions, today)
+
+        tomorrow_actions = [HourlyAction(hour=h, mode="SOLAR_PRIORITY", price_uah_mwh=1000.0)
+                             for h in range(24)]
+        fc.save_schedule(tomorrow_actions, tomorrow)
+
+        action = fc.get_current_action()
+        self.assertEqual(action.mode, "DISCHARGE_SELL",
+                          "today's schedule must still govern the current hour "
+                          "after tomorrow's schedule arrives early")
+        self.assertEqual(action.price_uah_mwh, 12000.0)
 
 
 # ── SQLiteStore Tests ─────────────────────────────────────────────────────────
