@@ -31,10 +31,21 @@ real vs. illustrative stays traceable.
 
 Actual vs. forecast stays clearly separated by measurement, exactly as the
 dashboard already expects: backfilled *past* days get `telemetry` points
-(actual, as if the device had really been running). Today/tomorrow get a
-`schedule` entry only (`expected_revenue_uah` — a projection, the same
-field the "Очікуваний дохід завтра" panel already reads) — never written
-to `telemetry`, since nothing has actually happened yet for those hours.
+(actual, as if the device had really been running). The future — out to
+`FORECAST_DAYS` (~4 months) — gets a `schedule` entry (`expected_revenue_uah`,
+the same field the "Очікуваний дохід завтра" panel reads) plus, separately,
+a `telemetry_forecast` measurement carrying the *same physical fields* as
+`telemetry` (PV power, battery power, SoC, temperature, ...) so the
+time-series panels (PV power, power balance, temperature, grid voltage)
+also have something to draw when the operator scrolls the dashboard's time
+range forward, instead of running into a wall at "now". This is still
+never written to `telemetry` itself — the panels union the two
+measurements at query time, splitting exactly at `now()`, so what's real
+and what's projected stays structurally distinguishable in InfluxDB even
+though the chart draws them as one continuous line. The forecast horizon
+necessarily uses the same illustrative fallback price curve as a genuine
+cold start (Section on price sourcing above) — no source claims to know
+real DAM auction results months ahead, because none exist yet.
 """
 
 from __future__ import annotations
@@ -62,9 +73,22 @@ from .logging_config import get_logger
 
 log = get_logger(__name__)
 
-BACKFILL_DAYS   = 35   # margin over the payback panel's 30-day window
-TICK_MINUTES    = 5    # telemetry resolution for backfilled days
+BACKFILL_DAYS   = 35    # margin over the payback panel's 30-day window
+MIN_COVERAGE_POINTS = 288   # a day needs at least this many telemetry points
+                             # (== a full synthetic backfill day at
+                             # TICK_MINUTES resolution) to count as
+                             # "covered" — fewer than that means a real but
+                             # partial live day, which still leaves a
+                             # visible gap on the dashboard and gets topped
+                             # up rather than skipped (see _has_telemetry).
+FORECAST_DAYS   = 120   # ~4 months — how far forward panels stay populated
+TICK_MINUTES    = 5     # telemetry resolution for backfilled (past) days
 TICK_SECONDS    = TICK_MINUTES * 60
+FORECAST_TICK_MINUTES = 15   # coarser resolution for the forward projection
+                              # — months of history don't need 5-min fidelity,
+                              # and it cuts the forecast horizon's write volume
+                              # by 3x on every idempotent startup check.
+FORECAST_TICK_SECONDS = FORECAST_TICK_MINUTES * 60
 
 
 async def ensure_history(writer: InfluxWriter, bucket: str, device_id: str,
@@ -110,28 +134,36 @@ async def ensure_history(writer: InfluxWriter, bucket: str, device_id: str,
     log.info("History backfill complete", days_filled=filled, days_already_present=skipped,
              window_start=start.isoformat(), window_end=(today - timedelta(days=1)).isoformat())
 
-    await _ensure_forecast(writer, bucket, optimizer, device_id, today, soc)
+    await _ensure_forward(writer, bucket, optimizer, emulator, device_id, today, soc)
 
 
 async def _replay_day(writer: InfluxWriter, emulator: "BESSEmulator", device_id: str,
-                       day: date, schedule: list) -> float:
-    """Step the real BESSEmulator through one historical day at
-    TICK_MINUTES resolution, writing telemetry as it goes. Returns the
-    SoC at end of day, to carry into the next day's optimizer call."""
+                       day: date, schedule: list, forecast: bool = False) -> float:
+    """Step the real BESSEmulator through one day, writing telemetry as it
+    goes. `forecast=False` (past days): TICK_MINUTES resolution, written to
+    `telemetry` — this is the backfill's "as if the device had really been
+    running" path. `forecast=True` (future days): coarser
+    FORECAST_TICK_MINUTES resolution, written to `telemetry_forecast` — a
+    clearly separate measurement, since nothing has actually happened yet
+    for a day that hasn't occurred. Returns the SoC at end of day, to carry
+    into the next day's optimizer call."""
     day_start = datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc)
+    step_minutes = FORECAST_TICK_MINUTES if forecast else TICK_MINUTES
+    step_seconds = FORECAST_TICK_SECONDS if forecast else TICK_SECONDS
+    write = writer.write_telemetry_forecast if forecast else writer.write_telemetry
 
-    for minute_of_day in range(0, 24 * 60, TICK_MINUTES):
+    for minute_of_day in range(0, 24 * 60, step_minutes):
         hour = minute_of_day // 60
         ts = day_start + timedelta(minutes=minute_of_day)
         action = schedule[hour]
 
         emulator.force_mode(action.mode, action.charge_pct, action.discharge_pct)
-        snapshot = await emulator.tick(as_of=ts, dt_s=float(TICK_SECONDS))
+        snapshot = await emulator.tick(as_of=ts, dt_s=float(step_seconds))
         snapshot.revenue_uah = compute_revenue_uah(
-            snapshot.grid_power_w, TICK_SECONDS, action.price_uah_mwh
+            snapshot.grid_power_w, step_seconds, action.price_uah_mwh
         )
         last_soc = snapshot.battery_soc_pct
-        await writer.write_telemetry(device_id, snapshot.to_dict())
+        await write(device_id, snapshot.to_dict())
 
     return last_soc
 
@@ -149,39 +181,99 @@ async def _prices_for(writer: InfluxWriter, bucket: str, device_id: str,
     return get_fallback_prices(day), "fallback"
 
 
-async def _ensure_forecast(writer: InfluxWriter, bucket: str, optimizer: "BESSOptimizer",
-                            device_id: str, today: date, soc: float) -> None:
-    """Guarantee today's and tomorrow's `schedule` (forecast) exist, so
-    "Дохід сьогодні" has a real price to price actual telemetry against as
-    soon as it arrives, and "Очікуваний дохід завтра" is never empty on a
-    fresh boot. Writes schedule only — never telemetry, these are
-    projections, not measurements."""
-    for offset, label in ((0, "today"), (1, "tomorrow")):
+async def _ensure_forward(writer: InfluxWriter, bucket: str, optimizer: "BESSOptimizer",
+                           emulator: "BESSEmulator", device_id: str, today: date,
+                           soc: float) -> None:
+    """Guarantee `schedule` + `telemetry_forecast` exist out to
+    `FORECAST_DAYS` ahead, so every dashboard panel — not just the
+    single-value economic ones — stays populated no matter how far forward
+    the operator scrolls the time range. "Дохід сьогодні" needs today's
+    price the moment real telemetry starts arriving; "Очікуваний дохід
+    завтра" needs tomorrow's; the PV/balance/temperature/voltage panels
+    need the whole horizon, because their Flux queries union `telemetry`
+    (real, up to now) with `telemetry_forecast` (projected, from now on) —
+    see the dashboard JSON and the module docstring.
+
+    Continues the *same* long-lived emulator instance used for the
+    historical backfill, so SoC carries through the today boundary
+    exactly as it would through any other day."""
+    filled, skipped = 0, 0
+    for offset in range(FORECAST_DAYS):
         d = today + timedelta(days=offset)
-        if await _has_schedule(writer, bucket, device_id, d):
+        has_schedule = await _has_schedule(writer, bucket, device_id, d)
+        has_telemetry_fc = await _has_telemetry_forecast(writer, bucket, device_id, d)
+
+        if has_schedule and has_telemetry_fc:
+            soc = await _last_known_soc_forecast(writer, bucket, device_id, d, soc)
+            skipped += 1
             continue
+
         prices, source = await _prices_for(writer, bucket, device_id, d)
         schedule = optimizer.optimize(prices, soc)
-        await writer.write_market_price(device_id, d.isoformat(), prices, source)
-        await writer.write_schedule(device_id, {
-            "valid_date": d.isoformat(),
-            "slots": [
-                {"hour": a.hour, "mode": a.mode,
-                 "price_uah_mwh": a.price_uah_mwh,
-                 "expected_revenue_uah": a.expected_revenue}
-                for a in schedule
-            ],
-        })
-        log.info("Forecast schedule ensured", which=label, date=d.isoformat(), source=source)
+
+        if not has_schedule:
+            await writer.write_market_price(device_id, d.isoformat(), prices, source)
+            await writer.write_schedule(device_id, {
+                "valid_date": d.isoformat(),
+                "slots": [
+                    {"hour": a.hour, "mode": a.mode,
+                     "price_uah_mwh": a.price_uah_mwh,
+                     "expected_revenue_uah": a.expected_revenue}
+                    for a in schedule
+                ],
+            })
+
+        if not has_telemetry_fc:
+            soc = await _replay_day(writer, emulator, device_id, d, schedule,
+                                     forecast=True)
+        filled += 1
+
+    log.info("Forward projection ensured", days_filled=filled, days_already_present=skipped,
+             horizon_days=FORECAST_DAYS, window_end=(today + timedelta(days=FORECAST_DAYS - 1)).isoformat())
 
 
 # ── InfluxDB gap-detection helpers ──────────────────────────────────────────
 
 async def _has_telemetry(writer: InfluxWriter, bucket: str, device_id: str, day: date) -> bool:
+    """A day counts as "covered" only once it has at least
+    MIN_COVERAGE_POINTS telemetry points — not merely "at least one".
+    A day where the edge was only briefly connected (a handful of live
+    points, then a multi-hour gap until the next reconnect) used to pass
+    the old any-point check and get skipped, leaving the empty stretch
+    visible on the dashboard's time-series panels even though the day
+    "had data" by the coarse day-level check. Backfilling such a day is
+    safe: the synthetic points land on a fixed 5-minute grid, while real
+    live telemetry is written on its own ~10s cadence, so the two
+    essentially never collide/overwrite — the result is the real points
+    plus synthetic ones filling what would otherwise be gaps, not real
+    data replaced by synthetic."""
+    # drop() before count() is required, not cosmetic: telemetry carries
+    # grid_status/inverter_mode tags that vary within a day (SOLAR_PRIORITY
+    # vs DISCHARGE_SELL, CONNECTED vs UNSTABLE, ...). Without dropping them
+    # first, count() groups per unique tag combination and returns one row
+    # per combination instead of a single daily total — the exact
+    # tag-splitting failure mode already documented for the Grafana panels
+    # themselves (see the dashboard's own history of this bug). Reading
+    # only rows[0] in that case undercounts, wrongly concludes a fully
+    # covered day is sparse, and re-backfills on top of it every restart.
     flux = f'''
 from(bucket:"{bucket}")
   |> range(start: {day.isoformat()}T00:00:00Z, stop: {(day + timedelta(days=1)).isoformat()}T00:00:00Z)
   |> filter(fn: (r) => r._measurement == "telemetry" and r._field == "revenue_uah" and r.device_id == "{device_id}")
+  |> drop(columns: ["grid_status", "inverter_mode", "device_id"])
+  |> count()
+'''
+    rows = await writer.query(flux)
+    count = int(rows[0]["_value"]) if rows else 0
+    return count >= MIN_COVERAGE_POINTS
+
+
+async def _has_telemetry_forecast(writer: InfluxWriter, bucket: str, device_id: str,
+                                   day: date) -> bool:
+    flux = f'''
+from(bucket:"{bucket}")
+  |> range(start: {day.isoformat()}T00:00:00Z, stop: {(day + timedelta(days=1)).isoformat()}T00:00:00Z)
+  |> filter(fn: (r) => r._measurement == "telemetry_forecast" and r._field == "revenue_uah" and r.device_id == "{device_id}")
   |> limit(n: 1)
 '''
     rows = await writer.query(flux)
@@ -220,6 +312,21 @@ async def _last_known_soc(writer: InfluxWriter, bucket: str, device_id: str,
 from(bucket:"{bucket}")
   |> range(start: {day.isoformat()}T00:00:00Z, stop: {(day + timedelta(days=1)).isoformat()}T00:00:00Z)
   |> filter(fn: (r) => r._measurement == "telemetry" and r._field == "battery_soc_pct" and r.device_id == "{device_id}")
+  |> sort(columns: ["_time"], desc: true)
+  |> limit(n: 1)
+'''
+    rows = await writer.query(flux)
+    if not rows:
+        return default
+    return float(rows[0]["_value"])
+
+
+async def _last_known_soc_forecast(writer: InfluxWriter, bucket: str, device_id: str,
+                                    day: date, default: float) -> float:
+    flux = f'''
+from(bucket:"{bucket}")
+  |> range(start: {day.isoformat()}T00:00:00Z, stop: {(day + timedelta(days=1)).isoformat()}T00:00:00Z)
+  |> filter(fn: (r) => r._measurement == "telemetry_forecast" and r._field == "battery_soc_pct" and r.device_id == "{device_id}")
   |> sort(columns: ["_time"], desc: true)
   |> limit(n: 1)
 '''
