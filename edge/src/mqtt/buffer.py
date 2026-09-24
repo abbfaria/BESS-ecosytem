@@ -1,11 +1,31 @@
 """
 SQLite-backed MQTT message buffer.
 
-Guarantees at-least-once delivery to the cloud broker:
-  - Outbound messages stored locally before sending
-  - On successful PUBACK (QoS 1), message marked delivered
-  - On reconnect, undelivered messages replayed in FIFO order
-  - Configurable max size; oldest entries purged when full
+Delivery semantics, stated precisely (they differ by QoS, and the
+difference is dictated by the MQTT protocol itself, not by this code):
+
+  QoS 1 — at-least-once.
+      The message is written here *before* it is handed to the broker, and
+      only marked delivered when the broker's PUBACK arrives (see
+      EdgeMQTTClient._on_publish). A crash or disconnect at any point
+      therefore leaves the message pending, and it is replayed on the next
+      connection.
+
+  QoS 0 — best-effort, but no longer silently dropped while offline.
+      The protocol provides no acknowledgement at all, so delivery can
+      never be *confirmed* for QoS 0. What this buffer does guarantee is
+      that a QoS 0 message published while the link is down is retained
+      and replayed on reconnect, rather than discarded. (Previously such
+      messages — which includes the entire high-rate telemetry stream —
+      were dropped outright during an outage.)
+
+On reconnect the client drains the whole backlog in FIFO order, not just
+the first batch.
+
+Capacity is bounded. When the backlog exceeds `max_messages`, the oldest
+*QoS 0* entries are discarded first, so a flood of telemetry can never
+evict the acknowledged-delivery traffic (faults, status, schedules) that
+QoS 1 exists to protect.
 """
 
 from __future__ import annotations
@@ -148,22 +168,36 @@ class MQTTBuffer:
         )
         self._stats["purged"] += r.rowcount
 
-        # 2. If still too many undelivered, drop oldest (lossy but bounded)
+        # 2. If still too many undelivered, drop oldest — but drop QoS 0
+        #    first. Telemetry (QoS 0, every 10 s) vastly outnumbers faults
+        #    and status (QoS 1, rare); without this ordering a long outage
+        #    would evict precisely the messages whose delivery the system
+        #    is supposed to guarantee.
         cur = self._conn.execute(
             "SELECT COUNT(*) FROM mqtt_buffer WHERE delivered=0"
         )
         count = cur.fetchone()[0]
-        if count > self._max_messages:
-            overflow = count - self._max_messages
+        if count <= self._max_messages:
+            return
+
+        overflow = count - self._max_messages
+        for qos_filter in ("qos = 0", "qos > 0"):
+            if overflow <= 0:
+                break
             r = self._conn.execute(
                 "DELETE FROM mqtt_buffer WHERE id IN ("
                 "  SELECT id FROM mqtt_buffer WHERE delivered=0"
+                f" AND {qos_filter}"
                 "  ORDER BY id ASC LIMIT ?"
                 ")",
                 (overflow,),
             )
-            self._stats["purged"] += r.rowcount
-            log.warning("Buffer overflow: purged oldest messages", count=overflow)
+            dropped = r.rowcount
+            if dropped:
+                self._stats["purged"] += dropped
+                log.warning("Buffer overflow: purged oldest messages",
+                            count=dropped, qos=qos_filter)
+            overflow -= dropped
 
     async def purge_delivered(self) -> int:
         async with self._lock:

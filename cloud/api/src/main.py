@@ -52,7 +52,13 @@ MARKET_FETCH_RETRY_S    = 900  # retry cadence while today's prices aren't publi
 
 _writer:     InfluxWriter    = None   # type: ignore
 _subscriber: MQTTSubscriber  = None   # type: ignore
-_market_task: "asyncio.Task | None" = None
+# Long-lived background tasks. References are retained deliberately: the
+# event loop keeps only weak references to tasks, so a bare
+# asyncio.create_task(...) whose result is discarded can be garbage
+# collected while still running.
+_market_task:    "asyncio.Task | None" = None
+_subscriber_task:"asyncio.Task | None" = None
+_backfill_task:  "asyncio.Task | None" = None
 
 
 async def _backfill_history_task() -> None:
@@ -107,7 +113,7 @@ async def _market_fetch_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    global _writer, _subscriber, _market_task
+    global _writer, _subscriber, _market_task, _subscriber_task, _backfill_task
     log.info("Cloud API starting")
     _writer = InfluxWriter(
         url=INFLUXDB_URL,
@@ -125,7 +131,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # fetches included) can take minutes, so this runs in the background
     # rather than blocking startup/the health check, same as
     # _market_fetch_loop below.
-    asyncio.create_task(_backfill_history_task(), name="history-backfill")
+    _backfill_task = asyncio.create_task(_backfill_history_task(), name="history-backfill")
 
     _subscriber = MQTTSubscriber(
         host=MQTT_BROKER_HOST,
@@ -135,15 +141,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         on_fault=_writer.write_fault,
         on_schedule=_writer.write_schedule,
     )
-    asyncio.create_task(_subscriber.run(), name="mqtt-subscriber")
+    _subscriber_task = asyncio.create_task(_subscriber.run(), name="mqtt-subscriber")
     _market_task = asyncio.create_task(_market_fetch_loop(), name="market-fetcher")
 
     log.info("Cloud API ready", influx=INFLUXDB_URL, mqtt=MQTT_BROKER_HOST)
     yield
 
     log.info("Cloud API shutting down")
-    if _market_task:
-        _market_task.cancel()
+    for task in (_market_task, _subscriber_task, _backfill_task):
+        if task:
+            task.cancel()
     if _subscriber:
         await _subscriber.stop()
     if _writer:

@@ -25,6 +25,14 @@ from ..utils.logging_config import get_logger
 
 log = get_logger(__name__)
 
+# Fault bitmask. Each bit is an independent, *recomputed* condition —
+# every one of these must be cleared as well as set, or a single
+# transient event latches an alarm for the lifetime of the process.
+FAULT_LOW_SOC        = 1
+FAULT_BLACKOUT_RISK  = 2
+FAULT_THERMAL        = 4
+FAULT_GRID_OUTAGE    = 8
+
 
 class BESSEmulator:
     """Physics-informed BESS emulator with realistic stochastic dynamics."""
@@ -302,15 +310,30 @@ class BESSEmulator:
         # SoC limits hard enforcement
         if batt_w > 0 and self._soc_pct >= self.cfg.soc_max_pct:
             batt_w = 0.0
-        if batt_w < 0 and self._soc_pct <= self.cfg.soc_min_pct:
+
+        # Low-SoC / blackout-risk conditions are *transient*: they describe
+        # the state right now, so they are recomputed (set AND cleared)
+        # every tick. Earlier revisions assigned these with `=`, which both
+        # latched them until the process restarted and clobbered the
+        # unrelated thermal/grid bits stored in the same bitmask.
+        low_soc = (batt_w < 0 and self._soc_pct <= self.cfg.soc_min_pct)
+        if low_soc:
             batt_w = 0.0
-            if self._mode == "DISCHARGE_SELL":
-                self._fault_code = 1  # low SoC alert
-            elif not self._grid_connected:
-                self._fault_code = 2  # blackout risk
+
+        self._set_fault(FAULT_LOW_SOC,
+                        low_soc and self._mode == "DISCHARGE_SELL")
+        self._set_fault(FAULT_BLACKOUT_RISK,
+                        low_soc and not self._grid_connected)
 
         self._commanded_batt_w = batt_w
         return batt_w, grid_w
+
+    def _set_fault(self, bit: int, active: bool) -> None:
+        """Set or clear one bit of the fault bitmask."""
+        if active:
+            self._fault_code |= bit
+        else:
+            self._fault_code &= ~bit
 
     # ── State evolution ───────────────────────────────────────────────────
 
@@ -333,9 +356,12 @@ class BESSEmulator:
         self._batt_temp_c += (target_temp - self._batt_temp_c) * min(1, dt_s / 600)
         self._batt_temp_c += random.gauss(0, 0.05)
 
-        # Check thermal fault
+        # Thermal fault, with hysteresis so a temperature hovering at the
+        # threshold doesn't chatter the alarm on and off each tick.
         if self._batt_temp_c > 45.0:
-            self._fault_code |= 4
+            self._set_fault(FAULT_THERMAL, True)
+        elif self._batt_temp_c < 43.0:
+            self._set_fault(FAULT_THERMAL, False)
 
     def _evolve_weather(self, dt_s: float) -> None:
         """Slow random walk for cloud cover; OU process for wind speed."""
@@ -359,7 +385,7 @@ class BESSEmulator:
             self._grid_fault_timer -= dt_s
             if self._grid_fault_timer <= 0:
                 self._grid_connected = True
-                self._fault_code &= ~8
+                self._set_fault(FAULT_GRID_OUTAGE, False)
                 log.info("Grid reconnected after simulated outage")
             return
 
@@ -377,7 +403,7 @@ class BESSEmulator:
             duration_s = random.expovariate(1/1800)   # avg 30 min outage
             self._grid_connected  = False
             self._grid_fault_timer = duration_s
-            self._fault_code |= 8
+            self._set_fault(FAULT_GRID_OUTAGE, True)
             log.warning("Simulated grid outage", duration_min=round(duration_s/60, 1))
 
     # ── Helpers ────────────────────────────────────────────────────────────

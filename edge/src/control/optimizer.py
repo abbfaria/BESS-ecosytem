@@ -51,6 +51,13 @@ class OptimizerConfig:
     max_daily_throughput_kwh: float = 20.0
     # Revenue threshold: only dispatch if price > this (avoid tiny arbitrage)
     min_spread_uah_mwh:       float = 500.0
+    # State of charge the schedule must leave in the battery at hour 23.
+    # Without this the horizon ends at midnight with no value attached to
+    # stored energy, so the optimum is always to sell the pack down to
+    # soc_min before the day ends — which then starves the *next* morning's
+    # peak, day after day. Requiring a terminal reserve makes consecutive
+    # single-day optimisations behave like a rolling schedule.
+    terminal_soc_pct:         float = 50.0
 
 
 @dataclass
@@ -68,26 +75,44 @@ class BESSOptimizer:
 
     def __init__(self, cfg: OptimizerConfig) -> None:
         self._cfg = cfg
+        # Which method actually produced the most recent schedule. Callers
+        # record this as the schedule's provenance; it must never be
+        # hardcoded, because the whole point of the greedy path is that it
+        # engages silently when MILP cannot run (a hardcoded "milp-v1" label
+        # is exactly what hid the PuLP incompatibility for so long).
+        self.last_method: str = "none"
 
     def optimize(
         self,
         prices_uah_mwh: list[float],
         current_soc_pct: float,
-        pv_forecast_kw: Optional[list[float]] = None,
-        load_forecast_kw: Optional[list[float]] = None,
     ) -> list[HourlyAction]:
-        """Return 24 HourlyAction objects for the next day."""
+        """Return 24 HourlyAction objects for the next day.
+
+        Note on scope: this is a pure *grid-arbitrage* model. PV output and
+        house load are deliberately not arguments — the emulator/plant
+        handles self-consumption physically, and the schedule only decides
+        when to buy from and sell to the grid. Earlier revisions accepted
+        `pv_forecast_kw`/`load_forecast_kw` and silently ignored them, which
+        implied a co-optimisation that was never implemented. Adding one is
+        a genuine modelling change (it alters what the revenue figures mean)
+        and is listed as further work rather than smuggled in here.
+        """
         assert len(prices_uah_mwh) == 24
 
         if _PULP_OK:
             try:
-                return self._milp_optimize(
-                    prices_uah_mwh, current_soc_pct,
-                    pv_forecast_kw, load_forecast_kw
-                )
+                actions = self._milp_optimize(prices_uah_mwh, current_soc_pct)
+                # _milp_optimize may itself fall back internally (infeasible);
+                # it sets last_method in that case, so only claim MILP here
+                # if it wasn't overridden.
+                if self.last_method != "greedy-v1":
+                    self.last_method = "milp-v1"
+                return actions
             except Exception as exc:
                 log.warning("MILP failed, falling back to greedy", exc=str(exc))
 
+        self.last_method = "greedy-v1"
         return self._greedy_optimize(prices_uah_mwh, current_soc_pct)
 
     # ── MILP optimizer ────────────────────────────────────────────────────────
@@ -96,8 +121,6 @@ class BESSOptimizer:
         self,
         prices: list[float],
         soc0: float,
-        pv_forecast: Optional[list[float]],
-        load_forecast: Optional[list[float]],
     ) -> list[HourlyAction]:
         cfg = self._cfg
         cap  = cfg.battery_capacity_kwh
@@ -145,11 +168,20 @@ class BESSOptimizer:
         prob += pulp.lpSum(p_chg[h] for h in range(24)) <= cfg.max_daily_throughput_kwh
         prob += pulp.lpSum(p_dis[h] for h in range(24)) <= cfg.max_daily_throughput_kwh
 
+        # Terminal reserve — see OptimizerConfig.terminal_soc_pct. Clamped to
+        # what is actually reachable from soc0 within the throughput cap so
+        # the model can never be made infeasible by this constraint alone.
+        reachable = soc_init + cfg.max_daily_throughput_kwh * eta_c
+        terminal_kwh = min(cfg.terminal_soc_pct / 100.0 * cap, soc_hi, reachable)
+        prob += soc[23] >= terminal_kwh
+
         solver = pulp.PULP_CBC_CMD(msg=0, timeLimit=10)
         prob.solve(solver)
 
         if prob.status != 1:
-            log.warning("MILP infeasible/no solution", status=prob.status)
+            log.warning("MILP infeasible/no solution — falling back to greedy",
+                        status=prob.status)
+            self.last_method = "greedy-v1"
             return self._greedy_optimize(prices, soc0)
 
         actions = []
