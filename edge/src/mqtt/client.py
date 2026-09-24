@@ -79,6 +79,12 @@ class EdgeMQTTClient:
         self._running   = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._subscriptions: list[tuple[str, int]] = []
+        # paho message-id → buffer row id, for QoS 1 messages awaiting PUBACK.
+        # Mutated from both the event loop (publish) and paho's network
+        # thread (_on_publish); dict get/set/pop are atomic under the GIL,
+        # which is sufficient for this access pattern.
+        self._inflight: dict[int, int] = {}
+        self._connect_task: Optional[asyncio.Task] = None
 
     # ── Context manager ───────────────────────────────────────────────────────
 
@@ -98,12 +104,27 @@ class EdgeMQTTClient:
             return
         self._running = True
         self._build_client()
-        asyncio.create_task(self._connect_loop(), name="mqtt-connect")
+        # Keep a reference: the event loop holds only a *weak* reference to
+        # tasks, so a fire-and-forget create_task() can be garbage-collected
+        # mid-flight.
+        self._connect_task = asyncio.create_task(
+            self._connect_loop(), name="mqtt-connect"
+        )
 
     async def stop(self) -> None:
         self._running = False
-        if self._client and self._connected:
-            self._client.disconnect()
+        if self._connect_task:
+            self._connect_task.cancel()
+            try:
+                await self._connect_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if self._client:
+            try:
+                self._client.disconnect()
+                self._client.loop_stop()
+            except Exception:
+                pass
         log.info("MQTT client stopped")
 
     def _build_client(self) -> None:
@@ -149,47 +170,44 @@ class EdgeMQTTClient:
     # ── Connection loop ───────────────────────────────────────────────────────
 
     async def _connect_loop(self) -> None:
-        while self._running:
-            try:
-                log.info("Connecting to MQTT broker",
-                         host=self._cfg.host, port=self._cfg.port)
-                self._client.connect_async(
-                    self._cfg.host,
-                    self._cfg.port,
-                    keepalive=_KEEPALIVE_S,
-                )
-                self._client.loop_start()
-                # Wait for connection (paho runs network I/O in background thread)
-                for _ in range(_CONNECT_TIMEOUT * 10):
-                    if self._connected:
-                        break
-                    await asyncio.sleep(0.1)
-                if not self._connected:
-                    raise ConnectionError("Connection timeout")
+        """Start paho's network thread once, then watch for connection
+        transitions.
 
-                self._backoff = _BACKOFF_MIN_S   # reset on success
-                # Re-subscribe to downlink topics
-                for topic, qos in self._subscriptions:
-                    self._client.subscribe(topic, qos)
-                # Replay buffered messages
-                await self._replay_buffer()
-
-                # Stay until disconnect
-                while self._running and self._connected:
-                    await asyncio.sleep(1.0)
-
-            except Exception as exc:
-                log.warning("MQTT connection failed",
-                            exc=str(exc), retry_in=round(self._backoff, 1))
-
-            if not self._running:
-                break
-            await asyncio.sleep(self._backoff)
-            jitter = self._backoff * _BACKOFF_JITTER
-            self._backoff = min(
-                _BACKOFF_MAX_S,
-                self._backoff * _BACKOFF_FACTOR + random.uniform(-jitter, jitter),
+        Reconnection is delegated entirely to paho (`reconnect_delay_set`
+        below). An earlier version drove its own connect/backoff loop *on
+        top of* paho's built-in auto-reconnect, so two independent
+        reconnect mechanisms raced each other on the same socket — each
+        iteration re-issued connect_async() and loop_start() against an
+        already-looping client. Now there is exactly one.
+        """
+        log.info("Connecting to MQTT broker",
+                 host=self._cfg.host, port=self._cfg.port)
+        self._client.reconnect_delay_set(min_delay=int(_BACKOFF_MIN_S),
+                                          max_delay=int(_BACKOFF_MAX_S))
+        try:
+            self._client.connect_async(
+                self._cfg.host, self._cfg.port, keepalive=_KEEPALIVE_S,
             )
+            self._client.loop_start()
+        except Exception as exc:
+            log.error("MQTT client could not be started", exc=str(exc))
+            return
+
+        was_connected = False
+        while self._running:
+            if self._connected and not was_connected:
+                # Fresh connection: subscriptions are re-applied in
+                # _on_connect (paho thread, immediately); drain the backlog
+                # here, on the event loop, where the buffer's asyncio lock
+                # can be awaited safely.
+                was_connected = True
+                try:
+                    await self._replay_buffer()
+                except Exception as exc:
+                    log.error("Buffer replay failed", exc=str(exc))
+            elif not self._connected and was_connected:
+                was_connected = False
+            await asyncio.sleep(1.0)
 
     # ── Publish API ───────────────────────────────────────────────────────────
 
@@ -200,23 +218,52 @@ class EdgeMQTTClient:
         qos: int = 1,
         buffer_on_fail: bool = True,
     ) -> bool:
-        """Publish a message. Buffers locally if broker unreachable."""
+        """Publish a message, with durability appropriate to its QoS.
+
+        QoS 1 — the message is persisted to the buffer *before* being
+        handed to paho, and is only marked delivered once the broker's
+        PUBACK arrives (_on_publish). paho's `rc == 0` means "accepted
+        into the client's outbound queue", which is emphatically not the
+        same as "the broker has it": an earlier version returned True on
+        rc == 0 and never wrote the message anywhere, so anything in
+        flight when the link dropped was lost without trace.
+
+        QoS 0 — unacknowledged by definition, so it is published directly
+        while connected. If the link is down it is buffered and replayed
+        on reconnect instead of being discarded (this is the telemetry
+        stream; dropping it was the single largest source of data loss).
+        """
         if isinstance(payload, dict):
             payload = json.dumps(payload, default=str).encode()
         elif isinstance(payload, str):
             payload = payload.encode()
 
+        # ── QoS 1: durable path ──────────────────────────────────────────
+        if qos > 0:
+            row_id = await self._buffer.enqueue(topic, payload, qos)
+            if self._connected and self._client:
+                try:
+                    info = self._client.publish(topic, payload, qos=qos)
+                    if info.rc == 0:
+                        # Delivery is confirmed later, in _on_publish.
+                        self._inflight[info.mid] = row_id
+                        return True
+                except Exception as exc:
+                    log.debug("Publish error", exc=str(exc))
+            return False    # stays pending in the buffer, replayed later
+
+        # ── QoS 0: best-effort path ──────────────────────────────────────
         if self._connected and self._client:
             try:
-                info = self._client.publish(topic, payload, qos=qos)
+                info = self._client.publish(topic, payload, qos=0)
                 if info.rc == 0:
                     return True
             except Exception as exc:
                 log.debug("Publish error", exc=str(exc))
 
-        if buffer_on_fail and qos > 0:
+        if buffer_on_fail:
             await self._buffer.enqueue(topic, payload, qos)
-            log.debug("Message buffered", topic=topic)
+            log.debug("QoS 0 message buffered while offline", topic=topic)
         return False
 
     def subscribe(self, topic: str, qos: int = 1) -> None:
@@ -228,22 +275,56 @@ class EdgeMQTTClient:
     # ── Buffer replay ─────────────────────────────────────────────────────────
 
     async def _replay_buffer(self) -> None:
-        count = await self._buffer.pending_count()
-        if count == 0:
+        """Drain the entire backlog, not just the first batch.
+
+        `iter_pending(batch_size=N)` is a single `LIMIT N` query, and this
+        method used to call it once per reconnect — so with a backlog of
+        several thousand messages only the first 200 were ever sent and
+        the remainder stayed pending forever, across every subsequent
+        reconnect. The outer loop keeps fetching batches until the
+        backlog is empty, the link drops, or a batch makes no progress.
+        """
+        pending = await self._buffer.pending_count()
+        if pending == 0:
             return
-        log.info("Replaying buffered messages", count=count)
-        async for msg in self._buffer.iter_pending(batch_size=200):
-            if not self._connected:
+        log.info("Replaying buffered messages", pending=pending)
+
+        delivered = 0
+        while self._running and self._connected:
+            batch = [m async for m in self._buffer.iter_pending(batch_size=200)]
+            if not batch:
                 break
-            try:
-                info = self._client.publish(msg.topic, msg.payload, qos=msg.qos)
-                if info.rc == 0:
-                    await self._buffer.mark_delivered(msg.id)
-                else:
+
+            progressed = False
+            for msg in batch:
+                if not self._connected:
+                    break
+                try:
+                    info = self._client.publish(msg.topic, msg.payload, qos=msg.qos)
+                    if info.rc == 0:
+                        # QoS 0 has no PUBACK to wait for, so it is settled
+                        # as soon as paho accepts it; QoS 1 is settled in
+                        # _on_publish when the broker acknowledges it.
+                        if msg.qos == 0:
+                            await self._buffer.mark_delivered(msg.id)
+                        else:
+                            self._inflight[info.mid] = msg.id
+                        delivered += 1
+                        progressed = True
+                    else:
+                        await self._buffer.increment_attempts(msg.id)
+                except Exception:
                     await self._buffer.increment_attempts(msg.id)
-            except Exception:
-                await self._buffer.increment_attempts(msg.id)
-            await asyncio.sleep(0.01)   # yield between replays
+                await asyncio.sleep(0.005)   # yield; avoid flooding paho's queue
+
+            if not progressed:
+                # Nothing in this batch could be handed off (broker refusing,
+                # outbound queue full). Stop rather than spin on it.
+                log.warning("Buffer replay stalled — will retry on next connect")
+                break
+
+        remaining = await self._buffer.pending_count()
+        log.info("Buffer replay finished", handed_off=delivered, still_pending=remaining)
 
     # ── Paho callbacks ────────────────────────────────────────────────────────
 
@@ -251,6 +332,14 @@ class EdgeMQTTClient:
         if reason_code == 0:
             self._connected = True
             log.info("MQTT connected", broker=self._cfg.host)
+            # Re-apply subscriptions here rather than from the monitor loop:
+            # the broker drops them on every disconnect, and doing it in the
+            # callback closes the window where a downlink could be missed.
+            for topic, qos in self._subscriptions:
+                try:
+                    client.subscribe(topic, qos)
+                except Exception as exc:
+                    log.error("Re-subscribe failed", topic=topic, exc=str(exc))
         else:
             log.error("MQTT connect refused", reason=reason_code)
 
@@ -266,7 +355,23 @@ class EdgeMQTTClient:
                 log.error("on_message callback error", exc=str(exc))
 
     def _on_publish(self, client, userdata, mid, reason_code, properties) -> None:
-        pass   # QoS 1 PUBACK; buffer mark_delivered handled in replay
+        """QoS 1 PUBACK — the only point at which delivery is actually known.
+
+        Runs on paho's network thread, so the buffer update (which takes an
+        asyncio lock) is handed back to the event loop rather than executed
+        here. Previously this callback did nothing at all and the comment
+        claimed replay handled it, which left QoS 1 messages published on a
+        live connection tracked by nothing whatsoever.
+        """
+        row_id = self._inflight.pop(mid, None)
+        if row_id is None or self._loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._buffer.mark_delivered(row_id), self._loop
+            )
+        except Exception as exc:
+            log.debug("Could not mark message delivered", mid=mid, exc=str(exc))
 
     @property
     def is_connected(self) -> bool:

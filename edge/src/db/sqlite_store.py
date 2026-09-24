@@ -9,8 +9,10 @@ Stores the last N telemetry readings locally for:
 
 from __future__ import annotations
 
+import functools
 import json
 import sqlite3
+import threading
 import time
 from datetime import date, timedelta
 from pathlib import Path
@@ -60,12 +62,27 @@ _RETENTION_HOURS = 48
 _MAX_ROWS        = 50_000
 
 
+def _synchronized(fn):
+    """Serialise a SQLiteStore method on the instance lock (see __init__)."""
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return fn(self, *args, **kwargs)
+    return wrapper
+
+
 class SQLiteStore:
     """Local edge telemetry and event store."""
 
     def __init__(self, db_path: str | Path = "/data/edge.db") -> None:
         self._path = Path(db_path)
         self._conn: Optional[sqlite3.Connection] = None
+        # sqlite3 is opened with check_same_thread=False so the connection
+        # can be reached from both the asyncio event-loop thread and
+        # paho-mqtt's network thread. That flag only disables Python's
+        # ownership *check* — it provides no actual serialisation, so a
+        # reentrant lock guards every statement.
+        self._lock = threading.RLock()
 
     def open(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -79,6 +96,7 @@ class SQLiteStore:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         log.info("SQLite store opened", path=str(self._path))
 
+    @_synchronized
     def close(self) -> None:
         if self._conn:
             self._conn.close()
@@ -86,6 +104,7 @@ class SQLiteStore:
 
     # ── Telemetry ─────────────────────────────────────────────────────────────
 
+    @_synchronized
     def insert_telemetry(self, snapshot_dict: dict) -> None:
         self._conn.execute(
             "INSERT INTO telemetry (ts, device_id, sequence_num, payload_json, stored_at)"
@@ -100,6 +119,7 @@ class SQLiteStore:
         )
         self._maybe_trim_telemetry()
 
+    @_synchronized
     def get_latest_telemetry(self, limit: int = 1) -> list[dict]:
         cur = self._conn.execute(
             "SELECT payload_json FROM telemetry ORDER BY id DESC LIMIT ?",
@@ -107,6 +127,7 @@ class SQLiteStore:
         )
         return [json.loads(row[0]) for row in cur.fetchall()]
 
+    @_synchronized
     def get_telemetry_range(self, from_ts: str, to_ts: str) -> list[dict]:
         cur = self._conn.execute(
             "SELECT payload_json FROM telemetry"
@@ -117,6 +138,7 @@ class SQLiteStore:
 
     # ── Events ────────────────────────────────────────────────────────────────
 
+    @_synchronized
     def log_event(self, event_type: str, message: str,
                   severity: str = "INFO", data: Optional[dict] = None) -> None:
         from datetime import datetime, timezone
@@ -132,6 +154,7 @@ class SQLiteStore:
             ),
         )
 
+    @_synchronized
     def get_recent_events(self, limit: int = 100, severity: Optional[str] = None) -> list[dict]:
         if severity:
             cur = self._conn.execute(
@@ -157,6 +180,7 @@ class SQLiteStore:
 
     # ── DAM price history (for real-data fallback) ───────────────────────────────
 
+    @_synchronized
     def save_dam_prices(self, valid_date: str, prices: list[float], source: str) -> None:
         """Cache a fetched 24h price curve. `source` is 'oree'/'entsoe'/'static'."""
         now = time.time()
@@ -172,6 +196,7 @@ class SQLiteStore:
         cutoff = (date.fromisoformat(valid_date) - timedelta(days=60)).isoformat()
         self._conn.execute("DELETE FROM dam_prices WHERE valid_date < ?", (cutoff,))
 
+    @_synchronized
     def get_real_price_history(self, max_days: int = 14) -> list[list[float]]:
         """Return up to `max_days` most recent *real* (non-static) 24h curves,
         most recent first — used to build a data-driven fallback curve."""
@@ -194,6 +219,7 @@ class SQLiteStore:
 
     # ── Maintenance ───────────────────────────────────────────────────────────
 
+    @_synchronized
     def _maybe_trim_telemetry(self) -> None:
         cutoff = time.time() - _RETENTION_HOURS * 3600
         self._conn.execute(
@@ -210,6 +236,7 @@ class SQLiteStore:
                 (count - _MAX_ROWS,),
             )
 
+    @_synchronized
     def get_stats(self) -> dict:
         cur = self._conn.execute("SELECT COUNT(*) FROM telemetry")
         t_count = cur.fetchone()[0]

@@ -425,6 +425,179 @@ class TestDAMClientHistoryFallback(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(p > 0 for p in prices))
 
 
+# ── Delivery-durability regression tests ──────────────────────────────────────
+#
+# Each test here pins down a defect that was found by auditing the delivery
+# path against live buffer contents. They are written as regressions: every
+# one of them fails against the previous implementation.
+
+class _FakePublishInfo:
+    def __init__(self, rc=0, mid=1):
+        self.rc = rc
+        self.mid = mid
+
+
+class _FakePahoClient:
+    """Minimal stand-in for paho's client: records publishes, never sends."""
+    def __init__(self, rc=0):
+        self.published = []
+        self._rc = rc
+        self._mid = 0
+
+    def publish(self, topic, payload, qos=0):
+        self._mid += 1
+        self.published.append((topic, payload, qos))
+        return _FakePublishInfo(rc=self._rc, mid=self._mid)
+
+    def subscribe(self, *a, **kw):
+        pass
+
+
+class TestBufferDurability(unittest.IsolatedAsyncioTestCase):
+
+    async def asyncSetUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self.buf = MQTTBuffer(db_path=Path(self._tmpdir) / "b.db", max_messages=100)
+        self.buf.open()
+
+    async def test_qos0_is_buffered_when_offline(self):
+        """Telemetry is QoS 0. The old client only buffered `qos > 0`, so an
+        outage silently discarded the entire telemetry stream — the buffer
+        on the live device contained zero telemetry rows."""
+        from src.mqtt.client import EdgeMQTTClient, MQTTClientConfig
+        client = EdgeMQTTClient(MQTTClientConfig(), self.buf)
+        client._connected = False           # simulate outage
+
+        ok = await client.publish("bess/x/telemetry", {"pv": 1}, qos=0)
+
+        self.assertFalse(ok)
+        self.assertEqual(await self.buf.pending_count(), 1,
+                          "QoS 0 message must be retained while offline")
+
+    async def test_qos1_is_persisted_before_send(self):
+        """QoS 1 must be written to the buffer *before* being handed to the
+        broker, so an in-flight message survives a crash. The old code
+        returned True on paho rc==0 without storing anything."""
+        from src.mqtt.client import EdgeMQTTClient, MQTTClientConfig
+        client = EdgeMQTTClient(MQTTClientConfig(), self.buf)
+        client._connected = True
+        client._client = _FakePahoClient()
+
+        ok = await client.publish("bess/x/status", {"a": 1}, qos=1)
+
+        self.assertTrue(ok)
+        # Still pending: only a PUBACK (_on_publish) may settle it.
+        self.assertEqual(await self.buf.pending_count(), 1)
+        self.assertEqual(len(client._inflight), 1)
+
+    async def test_puback_settles_the_buffered_message(self):
+        from src.mqtt.client import EdgeMQTTClient, MQTTClientConfig
+        client = EdgeMQTTClient(MQTTClientConfig(), self.buf)
+        client._connected = True
+        client._client = _FakePahoClient()
+        client._loop = asyncio.get_running_loop()
+
+        await client.publish("bess/x/status", {"a": 1}, qos=1)
+        mid = next(iter(client._inflight))
+        client._on_publish(None, None, mid, 0, None)
+        await asyncio.sleep(0.05)           # let the threadsafe call land
+
+        self.assertEqual(await self.buf.pending_count(), 0)
+
+    async def test_replay_drains_more_than_one_batch(self):
+        """iter_pending() is a single LIMIT query; replaying it once left
+        everything beyond the first batch pending forever. Observed live:
+        exactly 200 delivered, 2923 stranded."""
+        from src.mqtt.client import EdgeMQTTClient, MQTTClientConfig
+        big = MQTTBuffer(db_path=Path(self._tmpdir) / "big.db", max_messages=10_000)
+        big.open()
+        for i in range(450):                # > 2 batches of 200
+            await big.enqueue(f"bess/x/telemetry", f"m{i}".encode(), qos=0)
+
+        client = EdgeMQTTClient(MQTTClientConfig(), big)
+        client._connected = True
+        client._running = True
+        client._client = _FakePahoClient()
+
+        await client._replay_buffer()
+
+        self.assertEqual(await big.pending_count(), 0,
+                          "replay must drain the whole backlog, not one batch")
+
+    async def test_overflow_drops_qos0_before_qos1(self):
+        """A long outage floods the buffer with telemetry. Eviction must not
+        discard the acknowledged-delivery traffic it is meant to protect."""
+        small = MQTTBuffer(db_path=Path(self._tmpdir) / "s.db", max_messages=10)
+        small.open()
+        for i in range(5):
+            await small.enqueue("bess/x/fault", f"f{i}".encode(), qos=1)
+        for i in range(40):
+            await small.enqueue("bess/x/telemetry", f"t{i}".encode(), qos=0)
+
+        rows = [m async for m in small.iter_pending(batch_size=1000)]
+        self.assertEqual(sum(1 for m in rows if m.qos == 1), 5,
+                          "QoS 1 messages must survive a QoS 0 flood")
+
+
+class TestFaultBitmask(unittest.IsolatedAsyncioTestCase):
+
+    async def test_thermal_fault_clears_when_cool(self):
+        """Bits were set with |= but never cleared, so one transient event
+        latched an alarm until the process restarted — which then published
+        a QoS 1 fault every 10 s forever."""
+        from src.sensors.emulator import FAULT_THERMAL
+        em = BESSEmulator(EmulatorConfig())
+
+        em._batt_temp_c = 50.0
+        em._set_fault(FAULT_THERMAL, em._batt_temp_c > 45.0)
+        self.assertTrue(em._fault_code & FAULT_THERMAL)
+
+        em._batt_temp_c = 30.0
+        em._set_fault(FAULT_THERMAL, False)
+        self.assertFalse(em._fault_code & FAULT_THERMAL)
+
+    async def test_setting_one_bit_preserves_others(self):
+        """Low-SoC/blackout used plain `=`, wiping unrelated bits."""
+        from src.sensors.emulator import FAULT_THERMAL, FAULT_GRID_OUTAGE
+        em = BESSEmulator(EmulatorConfig())
+        em._set_fault(FAULT_GRID_OUTAGE, True)
+        em._set_fault(FAULT_THERMAL, True)
+        self.assertTrue(em._fault_code & FAULT_GRID_OUTAGE)
+        self.assertTrue(em._fault_code & FAULT_THERMAL)
+
+
+class TestOptimizerTerminalSoC(unittest.TestCase):
+
+    def test_schedule_leaves_a_terminal_reserve(self):
+        """With no terminal constraint the optimum is to sell the pack down
+        to soc_min every night, starving the next morning. A 15-day run
+        ended every single day at ~10% SoC."""
+        cfg = OptimizerConfig(terminal_soc_pct=50.0)
+        opt = BESSOptimizer(cfg)
+        prices = [1000.0] * 12 + [14000.0] * 12      # strong incentive to dump
+        actions = opt.optimize(prices, current_soc_pct=80.0)
+
+        cap = cfg.battery_capacity_kwh
+        soc = 80.0 / 100.0 * cap
+        for a in actions:
+            soc += (a.charge_pct / 100.0) * cfg.battery_charge_kw_max * cfg.charge_efficiency
+            soc -= (a.discharge_pct / 100.0) * cfg.battery_discharge_kw_max / cfg.discharge_efficiency
+        end_pct = soc / cap * 100.0
+
+        if opt.last_method == "milp-v1":
+            self.assertGreater(end_pct, 35.0,
+                                f"terminal reserve not honoured (ended {end_pct:.1f}%)")
+
+    def test_last_method_reports_real_provenance(self):
+        """optimizer_version was hardcoded `"milp-v1" if True else ...`, so
+        greedy-produced schedules were labelled MILP — which is precisely
+        what concealed the PuLP incompatibility."""
+        opt = BESSOptimizer(OptimizerConfig())
+        opt.optimize([5000.0] * 24, 50.0)
+        self.assertIn(opt.last_method, ("milp-v1", "greedy-v1"))
+        self.assertNotEqual(opt.last_method, "none")
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

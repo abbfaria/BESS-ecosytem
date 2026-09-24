@@ -83,6 +83,9 @@ class EdgeOrchestrator:
         self._running    = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._prices_today: Optional[list[float]] = None
+        # Last published fault bitmask, so faults are reported on change
+        # rather than re-sent on every sensor tick (see _sensor_loop).
+        self._last_fault_code: int = 0
 
     async def run(self) -> None:
         self._running = True
@@ -144,17 +147,27 @@ class EdgeOrchestrator:
                 payload = json.dumps(snap_dict, default=str)
                 await self._mqtt.publish(_topic("telemetry"), payload, qos=0)
 
-                # Fault alert
-                if snapshot.fault_code != 0:
+                # Fault alert — edge-triggered, not level-triggered.
+                # Publishing on every tick where fault_code != 0 meant one
+                # latched condition produced a QoS 1 message every 10 s
+                # indefinitely; a single incident filled the outbound buffer
+                # with thousands of duplicates of the same alarm. Emit only
+                # on an actual transition, including the return to healthy.
+                if snapshot.fault_code != self._last_fault_code:
                     fault_payload = json.dumps({
                         "ts": snap_dict["ts"],
                         "device_id": DEVICE_ID,
                         "fault_code": snapshot.fault_code,
-                        "severity": "WARNING",
-                        "message": f"Fault bitmask: {snapshot.fault_code:#010b}",
+                        "previous_fault_code": self._last_fault_code,
+                        "severity": "WARNING" if snapshot.fault_code else "INFO",
+                        "message": (
+                            f"Fault bitmask: {snapshot.fault_code:#010b}"
+                            if snapshot.fault_code else "All faults cleared"
+                        ),
                         "component": "bess",
                     })
                     await self._mqtt.publish(_topic("fault"), fault_payload, qos=1)
+                    self._last_fault_code = snapshot.fault_code
 
             except Exception as exc:
                 log.error("Sensor loop error", exc=str(exc))
@@ -254,7 +267,10 @@ class EdgeOrchestrator:
             "total_expected_revenue_uah": round(
                 sum(a.expected_revenue for a in actions), 2
             ),
-            "optimizer_version": "milp-v1" if True else "greedy-v1",
+            # Real provenance, not a hardcoded label: this records whether
+            # the exact solver or the greedy fallback actually produced the
+            # schedule (see BESSOptimizer.last_method).
+            "optimizer_version": self._optimizer.last_method,
         }
         await self._mqtt.publish(
             _topic("schedule"),
@@ -293,18 +309,40 @@ class EdgeOrchestrator:
     # ── Downlink handler ───────────────────────────────────────────────────────
 
     def _handle_downlink(self, topic: str, payload: bytes) -> None:
+        """MQTT downlink entry point — runs on paho's network thread.
+
+        Every handler below touches state owned by the event-loop thread:
+        the emulator (mutated by set_mode while tick() reads it), the
+        fallback controller (a dict plus a JSON file on disk) and the
+        SQLite store. Rather than bridging each handler individually — an
+        earlier version bridged only the market push and left the other
+        two racing — this single choke point moves *all* downlink
+        processing onto the event loop.
+        """
+        if self._loop is None:
+            log.warning("Downlink received before event loop was ready", topic=topic)
+            return
         try:
             data = json.loads(payload.decode())
         except Exception:
             log.warning("Invalid downlink payload", topic=topic)
             return
 
-        if topic.endswith("/schedule"):
-            self._apply_remote_schedule(data)
-        elif topic.endswith("/cmd"):
-            self._apply_command(data)
-        elif topic.endswith("/market"):
-            self._apply_market_push(data)
+        asyncio.run_coroutine_threadsafe(
+            self._dispatch_downlink(topic, data), self._loop
+        )
+
+    async def _dispatch_downlink(self, topic: str, data: dict) -> None:
+        """Runs on the event loop — safe to touch orchestrator state."""
+        try:
+            if topic.endswith("/schedule"):
+                self._apply_remote_schedule(data)
+            elif topic.endswith("/cmd"):
+                self._apply_command(data)
+            elif topic.endswith("/market"):
+                await self._apply_market_push(data)
+        except Exception as exc:
+            log.error("Downlink handler error", topic=topic, exc=str(exc))
 
     def _apply_remote_schedule(self, data: dict) -> None:
         from .control.optimizer import HourlyAction
@@ -337,36 +375,35 @@ class EdgeOrchestrator:
             self._emulator.set_mode(mode, duration_min=dur_min)
         log.info("Command applied", mode=mode, pwr_pct=pwr_pct, dur_min=dur_min)
 
-    def _apply_market_push(self, data: dict) -> None:
+    async def _apply_market_push(self, data: dict) -> None:
+        """Real DAM prices pushed down from the cloud.
+
+        Already on the event loop (see _handle_downlink), so the store
+        write and the optimizer run can simply be awaited in order.
+        """
         prices = [p["price_uah_mwh"] for p in data.get("prices", [])]
-        if len(prices) == 24:
-            self._prices_today = prices
-            valid_date = data.get("valid_date") or (
-                datetime.now(timezone.utc) + timedelta(days=1)
-            ).date().isoformat()
-            # Real prices fetched by the cloud's headless-browser scraper
-            # (see cloud/api/src/market_fetcher.py) — cache for the
-            # DAMClient's history-based fallback.
-            try:
-                self._store.save_dam_prices(valid_date, prices, "cloud")
-            except Exception as exc:
-                log.warning("Failed to cache cloud-pushed prices", exc=str(exc))
-            log.info("Market prices received from cloud", max=max(prices))
-            # Act on real data the moment it arrives, rather than waiting
-            # for _market_loop's own fixed daily window — that window
-            # resets on every container restart and is otherwise skipped
-            # for the rest of the day if missed, which is exactly what
-            # repeated network outages have been causing in practice.
-            #
-            # This callback runs on paho-mqtt's own network thread
-            # (client.loop_start()), not the asyncio event loop thread, so
-            # scheduling the coroutine must go through
-            # run_coroutine_threadsafe rather than create_task.
-            if self._loop is not None:
-                asyncio.run_coroutine_threadsafe(
-                    self._run_optimizer_and_publish(prices, valid_date),
-                    self._loop,
-                )
+        if len(prices) != 24:
+            log.warning("Ignoring market push with unexpected slot count",
+                        slots=len(prices))
+            return
+
+        self._prices_today = prices
+        valid_date = data.get("valid_date") or (
+            datetime.now(timezone.utc) + timedelta(days=1)
+        ).date().isoformat()
+        # Real prices fetched by the cloud's headless-browser scraper
+        # (see cloud/api/src/market_fetcher.py) — cache for the
+        # DAMClient's history-based fallback.
+        try:
+            self._store.save_dam_prices(valid_date, prices, "cloud")
+        except Exception as exc:
+            log.warning("Failed to cache cloud-pushed prices", exc=str(exc))
+        log.info("Market prices received from cloud", max=max(prices))
+        # Act on real data the moment it arrives, rather than waiting for
+        # _market_loop's own fixed daily window — that window resets on
+        # every container restart and is otherwise skipped for the rest of
+        # the day if missed.
+        await self._run_optimizer_and_publish(prices, valid_date)
 
     # ── FastAPI local API ─────────────────────────────────────────────────────
 
