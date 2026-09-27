@@ -201,7 +201,7 @@
     {
       "id": 6,
       "title": "Дохід сьогодні, грн",
-      "description": "Реалізований дохід з початку доби: продаж у мережу мінус купівля, за фактичною ціною РДН кожної години. Не залежить від перемикача часу вгорі — завжди показує поточну добу.",
+      "description": "Фактично зароблено від початку поточної доби (UTC) і до цього моменту — сума за кожну годину: середня потужність обміну з мережею × 1 год × ціна РДН тієї години. Від'ємне значення означає, що система за цей період більше купила, ніж продала. Показник накопичується протягом доби, тому вранці він завжди менший за підсумок доби.",
       "type": "stat",
       "gridPos": {
         "h": 4,
@@ -231,14 +231,14 @@
         {
           "refId": "A",
           "datasource": "InfluxDB-BESS",
-          "query": "import \"date\"\nfrom(bucket:\"telemetry\") |> range(start: date.truncate(t: now(), unit: 1d)) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"revenue_uah\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> sum()"
+          "query": "import \"date\"\nd0 = date.truncate(t: now(), unit: 1d)\nd1 = now()\n// Revenue is integrated per hour, not summed per sample: energy = mean power\n// over the hour x 1 h. Summing a per-sample revenue field made the daily\n// total proportional to how many samples happened to be recorded, so an hour\n// the device was only partly online was under-counted in proportion.\npower = from(bucket:\"telemetry\")\n  |> range(start: d0, stop: d1)\n  |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"grid_power_w\")\n  |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\n  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false, timeSrc: \"_start\")\n  |> keep(columns: [\"_time\", \"_value\"])\n  |> rename(columns: {_value: \"w\"})\n// Price comes from the market curve, not from the dispatch schedule: it is a\n// fact about the day regardless of whether a schedule was loaded.\n// A day can carry price points from more than one source (a real oree\n// curve and the illustrative fallback both live under the same\n// measurement, distinguished only by the `source` tag). Dropping the tag\n// and taking last() picked between them non-deterministically, so the\n// same hour could be valued at a real 11 666 or a fallback 5 499.\n// Sorting by source descending puts \"oree\" ahead of \"fallback\", so the\n// real market price always wins where one exists.\nprice = from(bucket:\"telemetry\")\n  |> range(start: d0, stop: d1)\n  |> filter(fn:(r) => r._measurement == \"market_price\" and r._field == \"price_uah_mwh\")\n  |> drop(columns: [\"device_id\"])\n  |> group(columns: [\"_time\"])\n  |> sort(columns: [\"source\"], desc: true)\n  |> first()\n  |> group()\n  |> keep(columns: [\"_time\", \"_value\"])\n  |> rename(columns: {_value: \"p\"})\nhourly = join(tables: {a: power, b: price}, on: [\"_time\"])\n  |> map(fn:(r) => ({_time: r._time, _value: -(r.w / 1000.0) * (r.p / 1000.0)}))\nhourly |> sum()"
         }
       ]
     },
     {
       "id": 7,
       "title": "Дохід вчора, грн",
-      "description": "Реалізований дохід за попередню повну добу. Не залежить від перемикача часу вгорі.",
+      "description": "Підсумок за повну попередню календарну добу (UTC), обчислений тим самим методом, що й «дохід сьогодні». Години, протягом яких вузол був недоступний, заповнюються стартовим сервісом історії фізично узгодженими даними, тому доба завжди повна.",
       "type": "stat",
       "gridPos": {
         "h": 4,
@@ -268,14 +268,14 @@
         {
           "refId": "A",
           "datasource": "InfluxDB-BESS",
-          "query": "import \"date\"\ny0 = date.add(d: -1d, to: date.truncate(t: now(), unit: 1d))\ny1 = date.truncate(t: now(), unit: 1d)\nfrom(bucket:\"telemetry\") |> range(start: y0, stop: y1) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"revenue_uah\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> sum()"
+          "query": "import \"date\"\nd0 = date.add(d: -1d, to: date.truncate(t: now(), unit: 1d))\nd1 = date.truncate(t: now(), unit: 1d)\n// Revenue is integrated per hour, not summed per sample: energy = mean power\n// over the hour x 1 h. Summing a per-sample revenue field made the daily\n// total proportional to how many samples happened to be recorded, so an hour\n// the device was only partly online was under-counted in proportion.\npower = from(bucket:\"telemetry\")\n  |> range(start: d0, stop: d1)\n  |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"grid_power_w\")\n  |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\n  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false, timeSrc: \"_start\")\n  |> keep(columns: [\"_time\", \"_value\"])\n  |> rename(columns: {_value: \"w\"})\n// Price comes from the market curve, not from the dispatch schedule: it is a\n// fact about the day regardless of whether a schedule was loaded.\n// A day can carry price points from more than one source (a real oree\n// curve and the illustrative fallback both live under the same\n// measurement, distinguished only by the `source` tag). Dropping the tag\n// and taking last() picked between them non-deterministically, so the\n// same hour could be valued at a real 11 666 or a fallback 5 499.\n// Sorting by source descending puts \"oree\" ahead of \"fallback\", so the\n// real market price always wins where one exists.\nprice = from(bucket:\"telemetry\")\n  |> range(start: d0, stop: d1)\n  |> filter(fn:(r) => r._measurement == \"market_price\" and r._field == \"price_uah_mwh\")\n  |> drop(columns: [\"device_id\"])\n  |> group(columns: [\"_time\"])\n  |> sort(columns: [\"source\"], desc: true)\n  |> first()\n  |> group()\n  |> keep(columns: [\"_time\", \"_value\"])\n  |> rename(columns: {_value: \"p\"})\nhourly = join(tables: {a: power, b: price}, on: [\"_time\"])\n  |> map(fn:(r) => ({_time: r._time, _value: -(r.w / 1000.0) * (r.p / 1000.0)}))\nhourly |> sum()"
         }
       ]
     },
     {
       "id": 8,
       "title": "Очікуваний дохід завтра, грн",
-      "description": "Запланований дохід на завтра за оптимізованим графіком заряду/розряду (ще не реалізований). Не залежить від перемикача часу вгорі.",
+      "description": "ПРОГНОЗ, а не факт. Це сума поля expected_revenue_uah з 24-годинного розкладу, який обчислює оптимізатор (MILP, PuLP/CBC; за потреби — резервний евристичний алгоритм) на основі опублікованих цін РДН на завтра та поточного рівня заряду батареї. Тобто це дохід, який система планує отримати, якщо виконає розклад і фактична генерація збігнеться з моделлю. Якщо реальні ціни на завтра ще не опубліковані на oree.com.ua, розклад будується на резервному ціновому профілі — у такому разі значення є орієнтовним (джерело даних позначається тегом source).",
       "type": "stat",
       "gridPos": {
         "h": 4,
@@ -311,7 +311,7 @@
         "x": 18,
         "y": 11
       },
-      "description": "Вартість системи (змінна вгорі дашборду) поділена на (середній дохід за останні 30 днів × 30)",
+      "description": "Вартість системи (змінна capex_uah угорі дашборда), поділена на середній добовий дохід за останні 30 діб × 30. «Ще немає доходу» означає, що середній добовий дохід за період ≤ 0.",
       "fieldConfig": {
         "defaults": {
           "unit": "none",
@@ -354,7 +354,7 @@
         {
           "refId": "A",
           "datasource": "InfluxDB-BESS",
-          "query": "import \"date\"\ncapex = float(v: \"${capex_uah}\")\navgDaily = from(bucket:\"telemetry\") |> range(start: -30d) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"revenue_uah\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> aggregateWindow(every: 1d, fn: sum, createEmpty: false) |> mean(column: \"_value\")\navgDaily |> map(fn: (r) => ({ r with _value: if r._value > 0.0 then capex / (r._value * 30.0) else -1.0 }))"
+          "query": "import \"date\"\nd0 = date.add(d: -30d, to: date.truncate(t: now(), unit: 1d))\nd1 = date.truncate(t: now(), unit: 1d)\n// Revenue is integrated per hour, not summed per sample: energy = mean power\n// over the hour x 1 h. Summing a per-sample revenue field made the daily\n// total proportional to how many samples happened to be recorded, so an hour\n// the device was only partly online was under-counted in proportion.\npower = from(bucket:\"telemetry\")\n  |> range(start: d0, stop: d1)\n  |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"grid_power_w\")\n  |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\n  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false, timeSrc: \"_start\")\n  |> keep(columns: [\"_time\", \"_value\"])\n  |> rename(columns: {_value: \"w\"})\n// Price comes from the market curve, not from the dispatch schedule: it is a\n// fact about the day regardless of whether a schedule was loaded.\n// A day can carry price points from more than one source (a real oree\n// curve and the illustrative fallback both live under the same\n// measurement, distinguished only by the `source` tag). Dropping the tag\n// and taking last() picked between them non-deterministically, so the\n// same hour could be valued at a real 11 666 or a fallback 5 499.\n// Sorting by source descending puts \"oree\" ahead of \"fallback\", so the\n// real market price always wins where one exists.\nprice = from(bucket:\"telemetry\")\n  |> range(start: d0, stop: d1)\n  |> filter(fn:(r) => r._measurement == \"market_price\" and r._field == \"price_uah_mwh\")\n  |> drop(columns: [\"device_id\"])\n  |> group(columns: [\"_time\"])\n  |> sort(columns: [\"source\"], desc: true)\n  |> first()\n  |> group()\n  |> keep(columns: [\"_time\", \"_value\"])\n  |> rename(columns: {_value: \"p\"})\nhourly = join(tables: {a: power, b: price}, on: [\"_time\"])\n  |> map(fn:(r) => ({_time: r._time, _value: -(r.w / 1000.0) * (r.p / 1000.0)}))\ncapex = float(v: \"${capex_uah}\")\navgDaily = hourly\n  |> aggregateWindow(every: 1d, fn: sum, createEmpty: false)\n  |> mean()\navgDaily |> map(fn:(r) => ({ r with _value: if r._value > 0.0 then capex / (r._value * 30.0) else -1.0 }))"
         }
       ]
     },
@@ -397,5 +397,5 @@
   "timezone": "browser",
   "title": "BESS – Огляд системи",
   "uid": "bess-overview-v1",
-  "version": 10
+  "version": 12
 }

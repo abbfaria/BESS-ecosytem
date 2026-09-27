@@ -48,6 +48,9 @@ MARKET_PUSH_DEVICE_IDS = [
 MARKET_FETCH_HOUR_UTC   = int(os.environ.get("MARKET_FETCH_HOUR_UTC", "13"))
 MARKET_FETCH_MINUTE_UTC = int(os.environ.get("MARKET_FETCH_MINUTE_UTC", "30"))
 MARKET_FETCH_RETRY_S    = 900  # retry cadence while today's prices aren't published yet
+# How often to re-check history/forecast completeness after startup. Hourly
+# bounds how long a gap opened by a host suspension can stay visible.
+BACKFILL_INTERVAL_S     = int(os.environ.get("BACKFILL_INTERVAL_S", "3600"))
 
 
 _writer:     InfluxWriter    = None   # type: ignore
@@ -62,14 +65,35 @@ _backfill_task:  "asyncio.Task | None" = None
 
 
 async def _backfill_history_task() -> None:
-    """One-shot at startup: fill any gaps in the last BACKFILL_DAYS of
-    history and ensure today/tomorrow's forecast schedule exists. See
-    history.py."""
-    for device_id in MARKET_PUSH_DEVICE_IDS:
-        try:
-            await ensure_history(_writer, INFLUXDB_BUCKET, device_id)
-        except Exception as exc:
-            log.error("History backfill failed", device_id=device_id, exc=str(exc))
+    """Keep history and forecast continuously complete — at startup *and*
+    periodically thereafter.
+
+    This used to run exactly once, at startup. That was enough only if the
+    stack then ran uninterrupted: whenever the host was suspended (the
+    normal case for a laptop-hosted testbed) the hours that elapsed while
+    it was down were never filled, because nothing re-ran the check. The
+    dashboard then showed whichever handful of hours happened to be live —
+    e.g. only 14:00-17:00 of a day, which in Ukraine's price profile is
+    precisely the midday solar-glut window where prices sit near the
+    technical minimum. The resulting "daily revenue" was arithmetically
+    correct and economically meaningless.
+
+    ensure_history() is idempotent and skips fully-covered days cheaply, so
+    re-running it hourly costs little and keeps every panel complete no
+    matter how the host's uptime is distributed.
+    """
+    first = True
+    while True:
+        for device_id in MARKET_PUSH_DEVICE_IDS:
+            try:
+                await ensure_history(_writer, INFLUXDB_BUCKET, device_id)
+            except Exception as exc:
+                log.error("History backfill failed", device_id=device_id, exc=str(exc))
+        if first:
+            log.info("History maintenance now running periodically",
+                     interval_min=BACKFILL_INTERVAL_S // 60)
+            first = False
+        await asyncio.sleep(BACKFILL_INTERVAL_S)
 
 
 async def _market_fetch_loop() -> None:
