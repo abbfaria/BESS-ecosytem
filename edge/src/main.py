@@ -86,6 +86,9 @@ class EdgeOrchestrator:
         # Last published fault bitmask, so faults are reported on change
         # rather than re-sent on every sensor tick (see _sensor_loop).
         self._last_fault_code: int = 0
+        # Hour for which a "no price available" warning was already emitted,
+        # so the sensor loop cannot log it once per 10 s tick.
+        self._price_warn_hour: int = -1
 
     async def run(self) -> None:
         self._running = True
@@ -133,7 +136,7 @@ class EdgeOrchestrator:
                 # actually exchanged with the grid (not the battery — PV-fed
                 # charging isn't a grid cost). + grid_power_w = import (cost),
                 # − grid_power_w = export (revenue).
-                price = self._fallback.get_current_action().price_uah_mwh
+                price = self._current_price_uah_mwh()
                 snapshot.revenue_uah = compute_revenue_uah(
                     snapshot.grid_power_w, TELEMETRY_INTERVAL_S, price
                 )
@@ -173,6 +176,42 @@ class EdgeOrchestrator:
                 log.error("Sensor loop error", exc=str(exc))
 
             await asyncio.sleep(TELEMETRY_INTERVAL_S)
+
+    def _current_price_uah_mwh(self) -> float:
+        """DAM price in effect for the current hour, for revenue accounting.
+
+        Preference order matters. The active schedule carries the price the
+        dispatch decision was made on, so it is authoritative when present.
+        But when no schedule is loaded, FallbackController._default_action()
+        reports price 0.0 — a placeholder meaning "unknown", which used to
+        flow straight into the revenue formula and value every kWh at
+        nothing. The locally cached DAM curve (populated from the cloud's
+        market pushes) is the correct second source: the market price for a
+        given hour is a fact about the day, not a property of whether this
+        device happens to hold a dispatch plan.
+        """
+        action = self._fallback.get_current_action()
+        if action.price_uah_mwh > 0:
+            return action.price_uah_mwh
+
+        now = datetime.now(timezone.utc)
+        try:
+            cached = self._store.get_price_for_hour(now.date().isoformat(), now.hour)
+        except Exception as exc:
+            log.debug("Price cache lookup failed", exc=str(exc))
+            cached = None
+
+        if cached is not None:
+            return cached
+
+        # Genuinely unknown: report it once per hour rather than silently
+        # booking the energy at zero.
+        if self._price_warn_hour != now.hour:
+            self._price_warn_hour = now.hour
+            log.warning("No DAM price available for current hour — "
+                        "revenue for this interval will be recorded as 0",
+                        hour=now.hour, date=now.date().isoformat())
+        return 0.0
 
     # ── Schedule application loop ─────────────────────────────────────────────
 

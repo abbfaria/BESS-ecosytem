@@ -197,6 +197,25 @@ class SQLiteStore:
         self._conn.execute("DELETE FROM dam_prices WHERE valid_date < ?", (cutoff,))
 
     @_synchronized
+    def get_price_for_hour(self, valid_date: str, hour: int) -> Optional[float]:
+        """The cached DAM price for one specific hour, or None if unknown.
+
+        Revenue accounting needs the *market* price, which is a fact about
+        the day independent of whether a dispatch schedule happens to be
+        loaded. Reading it from this cache lets the sensor loop keep
+        pricing energy correctly even when the schedule is missing — the
+        alternative was falling back to a 0.0 placeholder, which silently
+        values every kWh at nothing and is indistinguishable in the
+        dashboard from "no energy flowed".
+        """
+        cur = self._conn.execute(
+            "SELECT price_uah_mwh FROM dam_prices WHERE valid_date=? AND hour=?",
+            (valid_date, hour),
+        )
+        row = cur.fetchone()
+        return float(row[0]) if row else None
+
+    @_synchronized
     def get_real_price_history(self, max_days: int = 14) -> list[list[float]]:
         """Return up to `max_days` most recent *real* (non-static) 24h curves,
         most recent first — used to build a data-driven fallback curve."""
