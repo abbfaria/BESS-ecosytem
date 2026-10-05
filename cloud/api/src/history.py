@@ -98,8 +98,18 @@ async def ensure_history(writer: InfluxWriter, bucket: str, device_id: str,
     start = today - timedelta(days=BACKFILL_DAYS)
     day   = start
     filled, topped_up, skipped = 0, 0, 0
-    while day < today:
+    # Today is included, not excluded. The window used to stop at yesterday,
+    # which left any hour of *today* that elapsed while the host was asleep
+    # permanently empty — "Дохід сьогодні" then reported only the hours the
+    # machine happened to be awake for. Only hours strictly before the
+    # current one are eligible: the hour in progress is still accumulating
+    # live telemetry, and filling it would interleave synthetic points with
+    # real ones inside the same hour.
+    current_hour = datetime.now(timezone.utc).hour
+    while day <= today:
         missing = await _missing_hours(writer, bucket, device_id, day)
+        if day == today:
+            missing = {h for h in missing if h < current_hour}
         if not missing:
             # Still need to know the day's ending SoC to keep the *next*
             # day's optimizer input realistic — cheap to read back.
@@ -132,7 +142,7 @@ async def ensure_history(writer: InfluxWriter, bucket: str, device_id: str,
 
     log.info("History backfill complete", days_filled=filled, days_topped_up=topped_up,
              days_already_present=skipped,
-             window_start=start.isoformat(), window_end=(today - timedelta(days=1)).isoformat())
+             window_start=start.isoformat(), window_end=today.isoformat())
 
     await _ensure_forward(writer, bucket, optimizer, emulator, device_id, today, soc)
 
@@ -229,6 +239,18 @@ async def _ensure_forward(writer: InfluxWriter, bucket: str, optimizer: "BESSOpt
     filled, skipped, upgraded = 0, 0, 0
     near_term_upgrade_days = 2   # today + tomorrow: the only days for which
                                   # a same-day real-price upgrade is realistic
+
+    # Anchor the projection to the battery's *actual* current charge.
+    # Without this the forecast was computed once and then kept, so it
+    # drifted arbitrarily far from reality: with the pack sitting at 10%
+    # the stored projection still claimed 96% an hour later — a rise of
+    # 86 points in an hour, when 5 kW into a 20 kWh pack caps the physically
+    # possible rate at about 24 points. Re-anchoring makes the near-term
+    # curve start from where the device really is.
+    actual_soc = await _latest_actual_soc(writer, bucket, device_id)
+    if actual_soc is not None:
+        soc = actual_soc
+
     for offset in range(FORECAST_DAYS):
         d = today + timedelta(days=offset)
         has_schedule = await _has_schedule(writer, bucket, device_id, d)
@@ -237,6 +259,11 @@ async def _ensure_forward(writer: InfluxWriter, bucket: str, optimizer: "BESSOpt
             offset < near_term_upgrade_days and has_schedule
             and await _price_source(writer, bucket, device_id, d) == "fallback"
         )
+        # The near-term projection is always rebuilt, never reused: it is the
+        # part that viewers actually read ("will it charge this evening?"),
+        # and it is the part reality diverges from fastest.
+        if offset < near_term_upgrade_days:
+            has_telemetry_fc = False
 
         if has_schedule and has_telemetry_fc and not needs_upgrade:
             soc = await _last_known_soc_forecast(writer, bucket, device_id, d, soc)
@@ -390,6 +417,25 @@ from(bucket:"{bucket}")
     rows = await writer.query(flux)
     if not rows:
         return default
+    return float(rows[0]["_value"])
+
+
+async def _latest_actual_soc(writer: InfluxWriter, bucket: str, device_id: str
+                              ) -> Optional[float]:
+    """Most recent *measured* state of charge, or None if the device has
+    not reported recently. Used to anchor the forward projection to
+    reality rather than letting it continue from a stale assumption."""
+    flux = f'''
+from(bucket:"{bucket}")
+  |> range(start: -6h)
+  |> filter(fn: (r) => r._measurement == "telemetry" and r._field == "battery_soc_pct" and r.device_id == "{device_id}")
+  |> drop(columns: ["grid_status", "inverter_mode", "device_id"])
+  |> group()
+  |> last()
+'''
+    rows = await writer.query(flux)
+    if not rows:
+        return None
     return float(rows[0]["_value"])
 
 

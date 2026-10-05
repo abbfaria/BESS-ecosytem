@@ -598,6 +598,85 @@ class TestOptimizerTerminalSoC(unittest.TestCase):
         self.assertNotEqual(opt.last_method, "none")
 
 
+# ── Energy-balance / depletion regression tests ───────────────────────────────
+
+class TestEnergyConservation(unittest.TestCase):
+    """Grid flow must always follow from the battery power actually applied."""
+
+    def _balance(self, em, pv, wind, load):
+        batt, grid = em._compute_dispatch(pv_w=pv, wind_w=wind, load_w=load, utc_now=None)
+        return batt, grid, (load + batt - (pv + wind))
+
+    def test_empty_battery_cannot_export(self):
+        """The observed defect: DISCHARGE_SELL with an empty pack reported
+        the full planned export (PV 0, load 1.6 kW, battery 0 W, grid
+        -1.9 kW) because grid_w was computed before the SoC clamp and never
+        recomputed — inventing energy, which was then sold as revenue."""
+        em = BESSEmulator(EmulatorConfig())
+        em._soc_pct = 10.0
+        em.force_mode("DISCHARGE_SELL", discharge_pct=70.0)
+        batt, grid, expected = self._balance(em, pv=0.0, wind=0.0, load=1600.0)
+        self.assertEqual(batt, 0.0, "empty pack must not discharge")
+        self.assertGreater(grid, 0.0, "house load must be met by import, not phantom export")
+        self.assertAlmostEqual(grid, expected, places=6)
+
+    def test_full_battery_does_not_phantom_import(self):
+        em = BESSEmulator(EmulatorConfig())
+        em._soc_pct = 95.0
+        em.force_mode("GRID_CHARGE", charge_pct=100.0)
+        batt, grid, expected = self._balance(em, pv=0.0, wind=0.0, load=500.0)
+        self.assertEqual(batt, 0.0, "full pack must not charge")
+        self.assertAlmostEqual(grid, expected, places=6)
+
+    def test_balance_holds_across_modes_and_soc(self):
+        for mode in ("SOLAR_PRIORITY", "GRID_CHARGE", "DISCHARGE_SELL", "IDLE"):
+            for soc in (10.0, 50.0, 95.0):
+                em = BESSEmulator(EmulatorConfig())
+                em._soc_pct = soc
+                em.force_mode(mode, charge_pct=100.0, discharge_pct=100.0)
+                batt, grid, expected = self._balance(em, pv=3000.0, wind=0.0, load=1200.0)
+                self.assertAlmostEqual(
+                    grid, expected, places=6,
+                    msg=f"energy balance violated in {mode} at SoC {soc}%")
+
+
+class TestFallbackDepletion(unittest.TestCase):
+    """The rule-based fallback must not pin the pack at its floor."""
+
+    def test_does_not_discharge_when_depleted(self):
+        fc = FallbackController(Path(tempfile.mktemp()))
+        action = fc._default_action(19, soc_pct=10.0)    # evening peak, empty
+        self.assertNotEqual(action.mode, "DISCHARGE_SELL",
+                             "commanding discharge into an empty pack does nothing "
+                             "except hold the low-SoC fault up")
+
+    def test_still_discharges_at_peak_when_charged(self):
+        fc = FallbackController(Path(tempfile.mktemp()))
+        action = fc._default_action(19, soc_pct=80.0)
+        self.assertEqual(action.mode, "DISCHARGE_SELL")
+
+    def test_recharges_during_day_when_depleted(self):
+        fc = FallbackController(Path(tempfile.mktemp()))
+        action = fc._default_action(12, soc_pct=10.0)
+        self.assertEqual(action.mode, "GRID_CHARGE",
+                          "a depleted pack should be topped up rather than waiting "
+                          "for the 00:00-06:00 window")
+
+    def test_unknown_soc_keeps_previous_clock_only_behaviour(self):
+        fc = FallbackController(Path(tempfile.mktemp()))
+        self.assertEqual(fc._default_action(19).mode, "DISCHARGE_SELL")
+        self.assertEqual(fc._default_action(2).mode, "GRID_CHARGE")
+
+    def test_has_schedule_for(self):
+        from src.control.optimizer import HourlyAction
+        fc = FallbackController(Path(tempfile.mktemp()))
+        self.assertFalse(fc.has_schedule_for("2026-10-05"))
+        fc.save_schedule([HourlyAction(hour=h, mode="SOLAR_PRIORITY") for h in range(24)],
+                          "2026-10-05")
+        self.assertTrue(fc.has_schedule_for("2026-10-05"))
+        self.assertFalse(fc.has_schedule_for("2026-10-06"))
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

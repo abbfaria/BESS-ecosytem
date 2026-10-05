@@ -265,49 +265,32 @@ class BESSEmulator:
         batt_max_dis_w  = self.cfg.battery_discharge_kw_max * 1000.0
 
         if not self._grid_connected:
-            # Island mode: battery must cover deficit
-            if surplus >= 0:
-                # Charge battery with surplus
-                batt_w = min(surplus, batt_max_chg_w)
-            else:
-                # Discharge to cover load
-                batt_w = max(surplus, -batt_max_dis_w)
-            return batt_w, 0.0
+            # Island mode: the battery alone balances the node. This used to
+            # return early, which skipped the SoC clamp below entirely and
+            # let an islanded node discharge straight through soc_min.
+            batt_w = (min(surplus, batt_max_chg_w) if surplus >= 0
+                      else max(surplus, -batt_max_dis_w))
 
-        if self._mode == "SOLAR_PRIORITY":
-            if surplus > 0:
-                batt_w  = min(surplus, batt_max_chg_w)
-                grid_w  = surplus - batt_w   # export remainder
-                grid_w  = -grid_w            # export is negative
-            else:
-                batt_w  = max(surplus, -batt_max_dis_w)
-                grid_w  = -(surplus - batt_w)  # import remainder
+        # Each mode decides only the *battery* set-point. Grid flow is then
+        # derived from it below, after the SoC limits have had their say.
+        elif self._mode == "SOLAR_PRIORITY":
+            batt_w = (min(surplus, batt_max_chg_w) if surplus > 0
+                      else max(surplus, -batt_max_dis_w))
 
         elif self._mode == "GRID_CHARGE":
-            chg_w   = batt_max_chg_w * self._charge_pct / 100.0
-            batt_w  = min(chg_w, batt_max_chg_w)
-            grid_w  = load_w + batt_w - total_gen  # import = load + charge - gen
+            batt_w = min(batt_max_chg_w * self._charge_pct / 100.0, batt_max_chg_w)
 
         elif self._mode == "DISCHARGE_SELL":
-            dis_w   = batt_max_dis_w * self._discharge_pct / 100.0
-            batt_w  = -min(dis_w, batt_max_dis_w)
-            # Export: gen + discharge - load
-            export  = total_gen + abs(batt_w) - load_w
-            grid_w  = -max(0.0, export)  # negative = export
+            batt_w = -min(batt_max_dis_w * self._discharge_pct / 100.0, batt_max_dis_w)
 
         elif self._mode == "BACKUP_MODE":
-            if surplus >= 0:
-                batt_w = min(surplus, batt_max_chg_w)
-                grid_w = 0.0
-            else:
-                batt_w = max(surplus, -batt_max_dis_w)
-                grid_w = max(0.0, -(surplus - batt_w))  # import only if batt can't cover
+            batt_w = (min(surplus, batt_max_chg_w) if surplus >= 0
+                      else max(surplus, -batt_max_dis_w))
 
         else:   # IDLE
             batt_w = 0.0
-            grid_w = load_w - total_gen  # import/export to balance
 
-        # SoC limits hard enforcement
+        # ── SoC limits, applied before grid flow is derived ───────────────
         if batt_w > 0 and self._soc_pct >= self.cfg.soc_max_pct:
             batt_w = 0.0
 
@@ -324,6 +307,25 @@ class BESSEmulator:
                         low_soc and self._mode == "DISCHARGE_SELL")
         self._set_fault(FAULT_BLACKOUT_RISK,
                         low_soc and not self._grid_connected)
+
+        # ── Grid flow = whatever the node cannot balance itself ───────────
+        # Single energy-balance identity for every grid-connected mode:
+        #   import(+) = load + battery_charge - generation
+        # Deriving it here, from the *final* batt_w, is what keeps the model
+        # physically consistent. Previously each mode computed grid_w from
+        # its own un-clamped battery set-point, and the SoC limits were
+        # applied afterwards without recomputing it — so a DISCHARGE_SELL
+        # hour with an empty battery reported the full planned export even
+        # though the battery contributed nothing. Observed live: PV 0 W,
+        # load 1.6 kW, battery 0 W, grid -1.9 kW — 1.9 kW exported out of
+        # thin air, and then billed as revenue.
+        if not self._grid_connected:
+            grid_w = 0.0
+        elif self._mode == "BACKUP_MODE":
+            # Backup never exports; it only draws what the battery cannot cover.
+            grid_w = max(0.0, load_w + batt_w - total_gen)
+        else:
+            grid_w = load_w + batt_w - total_gen
 
         self._commanded_batt_w = batt_w
         return batt_w, grid_w

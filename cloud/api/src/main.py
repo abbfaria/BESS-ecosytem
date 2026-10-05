@@ -51,6 +51,9 @@ MARKET_FETCH_RETRY_S    = 900  # retry cadence while today's prices aren't publi
 # How often to re-check history/forecast completeness after startup. Hourly
 # bounds how long a gap opened by a host suspension can stay visible.
 BACKFILL_INTERVAL_S     = int(os.environ.get("BACKFILL_INTERVAL_S", "3600"))
+# Ceiling for one maintenance pass. A cold 35-day backfill with live price
+# fetches takes minutes; anything approaching this is wedged, not slow.
+BACKFILL_MAX_RUNTIME_S  = int(os.environ.get("BACKFILL_MAX_RUNTIME_S", "1800"))
 
 
 _writer:     InfluxWriter    = None   # type: ignore
@@ -84,15 +87,36 @@ async def _backfill_history_task() -> None:
     """
     first = True
     while True:
+        started = datetime.now(timezone.utc)
         for device_id in MARKET_PUSH_DEVICE_IDS:
             try:
-                await ensure_history(_writer, INFLUXDB_BUCKET, device_id)
+                # Bound the whole pass. Any single await inside it that never
+                # returns — a wedged browser pipe after the host suspends is
+                # the observed case — would otherwise stop this loop forever,
+                # silently: the task simply never reaches its next iteration,
+                # so there is no exception to log and no restart to trigger.
+                # Losing one pass costs nothing; ensure_history is idempotent
+                # and the next pass redoes the work.
+                await asyncio.wait_for(
+                    ensure_history(_writer, INFLUXDB_BUCKET, device_id),
+                    timeout=BACKFILL_MAX_RUNTIME_S,
+                )
+            except asyncio.TimeoutError:
+                log.error("History backfill exceeded its runtime budget — "
+                          "abandoning this pass, will retry next interval",
+                          device_id=device_id, budget_s=BACKFILL_MAX_RUNTIME_S)
             except Exception as exc:
                 log.error("History backfill failed", device_id=device_id, exc=str(exc))
+
         if first:
             log.info("History maintenance now running periodically",
                      interval_min=BACKFILL_INTERVAL_S // 60)
             first = False
+        # Heartbeat: makes a stalled loop visible in the log instead of
+        # having to infer it from missing data days later.
+        log.info("History maintenance pass finished",
+                 took_s=round((datetime.now(timezone.utc) - started).total_seconds(), 1),
+                 next_in_min=BACKFILL_INTERVAL_S // 60)
         await asyncio.sleep(BACKFILL_INTERVAL_S)
 
 

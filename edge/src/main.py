@@ -136,7 +136,7 @@ class EdgeOrchestrator:
                 # actually exchanged with the grid (not the battery — PV-fed
                 # charging isn't a grid cost). + grid_power_w = import (cost),
                 # − grid_power_w = export (revenue).
-                price = self._current_price_uah_mwh()
+                price = self._current_price_uah_mwh(snapshot.battery_soc_pct)
                 snapshot.revenue_uah = compute_revenue_uah(
                     snapshot.grid_power_w, TELEMETRY_INTERVAL_S, price
                 )
@@ -177,7 +177,7 @@ class EdgeOrchestrator:
 
             await asyncio.sleep(TELEMETRY_INTERVAL_S)
 
-    def _current_price_uah_mwh(self) -> float:
+    def _current_price_uah_mwh(self, soc_pct: Optional[float] = None) -> float:
         """DAM price in effect for the current hour, for revenue accounting.
 
         Preference order matters. The active schedule carries the price the
@@ -190,7 +190,7 @@ class EdgeOrchestrator:
         given hour is a fact about the day, not a property of whether this
         device happens to hold a dispatch plan.
         """
-        action = self._fallback.get_current_action()
+        action = self._fallback.get_current_action(soc_pct=soc_pct)
         if action.price_uah_mwh > 0:
             return action.price_uah_mwh
 
@@ -215,11 +215,40 @@ class EdgeOrchestrator:
 
     # ── Schedule application loop ─────────────────────────────────────────────
 
+    async def _ensure_today_schedule(self) -> None:
+        """Make sure a schedule exists for today, computing one if not.
+
+        Schedule acquisition used to be purely event-driven on two
+        once-daily timers: the cloud's market push (13:30 UTC) and this
+        node's own _market_loop (14:00 UTC). A device that happened to be
+        asleep at both moments — the normal case here, where the host is a
+        laptop — never obtained a schedule for that day at all and spent
+        the whole day on the crude rule-based fallback, ignoring real
+        prices entirely. Checking on every schedule tick closes that: the
+        node becomes self-sufficient and recovers within the hour no matter
+        when it wakes up, without depending on the cloud being reachable.
+        """
+        today = datetime.now(timezone.utc).date()
+        if self._fallback.has_schedule_for(today.isoformat()):
+            return
+
+        log.info("No schedule for today — computing one now", date=today.isoformat())
+        try:
+            prices = await self._dam.get_prices(for_date=today)
+            await self._run_optimizer_and_publish(prices, today.isoformat())
+            log.info("Today's schedule computed locally", date=today.isoformat(),
+                     method=self._optimizer.last_method)
+        except Exception as exc:
+            log.error("Could not compute today's schedule", exc=str(exc))
+
     async def _schedule_loop(self) -> None:
         log.info("Schedule loop started")
         while self._running:
             try:
-                action = self._fallback.get_current_action()
+                await self._ensure_today_schedule()
+                latest = self._store.get_latest_telemetry(1)
+                soc = latest[0].get("battery_soc_pct") if latest else None
+                action = self._fallback.get_current_action(soc_pct=soc)
                 self._emulator.set_mode(
                     action.mode,
                     charge_pct=action.charge_pct,

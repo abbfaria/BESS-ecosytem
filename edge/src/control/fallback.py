@@ -117,10 +117,14 @@ class FallbackController:
             log.error("Failed to load schedule", exc=str(exc))
             return False
 
-    def get_current_action(self) -> HourlyAction:
+    def get_current_action(self, soc_pct: Optional[float] = None) -> HourlyAction:
         """Return the appropriate action for the current hour, using
         *today's* stored schedule specifically — never a schedule for any
-        other date, but critically also never displaced by one."""
+        other date, but critically also never displaced by one.
+
+        `soc_pct` is only consulted when falling back to the rule-based
+        default; an actual schedule already accounts for state of charge
+        through the optimizer."""
         now   = datetime.now(timezone.utc)
         hour  = now.hour
         today = now.strftime("%Y-%m-%d")
@@ -132,20 +136,54 @@ class FallbackController:
         if self._schedules:
             log.warning("No stored schedule for today", today=today,
                         stored_dates=sorted(self._schedules))
-        return self._default_action(hour)
+        return self._default_action(hour, soc_pct)
 
-    def _default_action(self, hour: int) -> HourlyAction:
-        """Conservative safe defaults when no schedule is available."""
-        # Night valley (00–06): gentle grid charge if SoC low is handled by caller
-        # Morning/evening peaks: discharge
-        # Day: solar priority
+    def _default_action(self, hour: int, soc_pct: Optional[float] = None) -> HourlyAction:
+        """Conservative safe defaults when no schedule is available.
+
+        `soc_pct` makes the fallback state-aware. Without it the rule was
+        purely clock-driven: discharge every evening peak regardless of how
+        much charge was left, and only ever replenish between 00:00 and
+        06:00. A node that is awake mostly during the day therefore walked
+        its battery down to soc_min and stayed pinned there — repeatedly
+        commanding DISCHARGE_SELL into an empty pack, which does nothing
+        except keep the low-SoC fault raised.
+        """
+        # Below this, the pack is treated as needing replenishment before it
+        # is allowed to serve another discharge window.
+        RESERVE_PCT = 35.0
+
+        depleted = soc_pct is not None and soc_pct <= RESERVE_PCT
+
+        # Night valley: always the cheapest window, so always a good time to
+        # refill — more so when depleted.
         if 0 <= hour < 6:
             return HourlyAction(hour=hour, mode="GRID_CHARGE",
-                                charge_pct=50.0, price_uah_mwh=0.0)
+                                charge_pct=80.0 if depleted else 50.0,
+                                price_uah_mwh=0.0)
+
+        # Peak windows: only discharge if there is actually something to sell.
         if hour in (7, 8, 9, 18, 19, 20, 21):
+            if depleted:
+                # Nothing worth selling. Let PV cover the house and bank any
+                # surplus instead of commanding a discharge that cannot run.
+                return HourlyAction(hour=hour, mode="SOLAR_PRIORITY")
             return HourlyAction(hour=hour, mode="DISCHARGE_SELL",
                                 discharge_pct=70.0, price_uah_mwh=0.0)
+
+        # Daylight hours: if the pack is low, actively top it up from the
+        # grid rather than waiting for midnight; PV surplus is used first by
+        # the dispatch model either way.
+        if depleted and 10 <= hour <= 16:
+            return HourlyAction(hour=hour, mode="GRID_CHARGE",
+                                charge_pct=60.0, price_uah_mwh=0.0)
+
         return HourlyAction(hour=hour, mode="SOLAR_PRIORITY")
+
+    def has_schedule_for(self, date_str: str) -> bool:
+        """Whether a complete 24-slot schedule is held for that date."""
+        sched = self._schedules.get(date_str)
+        return bool(sched) and len(sched) == 24
 
     @property
     def has_schedule(self) -> bool:

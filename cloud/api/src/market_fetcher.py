@@ -17,6 +17,7 @@ edge/src/main.py) rather than requiring edge to run a browser itself.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import date
 from typing import Optional
@@ -33,6 +34,9 @@ except ImportError:
 
 _OREE_PRICE_PAGE = "https://www.oree.com.ua/index.php/pricectr"
 _PAGE_TIMEOUT_MS = 30_000
+# Hard ceiling for one complete fetch attempt, including browser
+# startup and teardown — the parts no per-operation timeout covers.
+_FETCH_TIMEOUT_S = 90
 
 
 async def fetch_dam_prices(for_date: date) -> Optional[list[float]]:
@@ -41,11 +45,31 @@ async def fetch_dam_prices(for_date: date) -> Optional[list[float]]:
     date isn't in the currently displayed month (a page for a different
     month would need date-picker navigation, not implemented), or the row
     can't be parsed — callers should treat that as "try the next source".
+
+    The whole browser session is bounded by `_FETCH_TIMEOUT_S`. The
+    per-operation timeouts below cover goto/wait_for, but nothing covered
+    browser startup or `browser.close()`, and those are exactly what hangs
+    when the host suspends mid-session: Chromium is killed, while the
+    Python side keeps awaiting a pipe that will never answer. With no
+    outer bound that await never returns, and because it is awaited from a
+    long-lived background task the whole task stops silently — no
+    exception, no log line, just a loop that never comes round again.
     """
     if not _PLAYWRIGHT_OK:
         log.warning("playwright not installed — oree.com.ua fetch disabled")
         return None
 
+    try:
+        return await asyncio.wait_for(
+            _fetch_dam_prices_inner(for_date), timeout=_FETCH_TIMEOUT_S
+        )
+    except asyncio.TimeoutError:
+        log.warning("oree.com.ua fetch exceeded its overall budget — abandoning",
+                    date=for_date.isoformat(), budget_s=_FETCH_TIMEOUT_S)
+        return None
+
+
+async def _fetch_dam_prices_inner(for_date: date) -> Optional[list[float]]:
     target = for_date.strftime("%d.%m.%Y")
 
     try:
