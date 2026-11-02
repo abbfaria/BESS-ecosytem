@@ -61,7 +61,9 @@ jobs:
       - name: Build and deploy
         run: |
           cd "$HOME/Code/bess-ecosystem/edge"
-          docker compose up -d --build
+          # Same project name as bess-edge.service — a different one gets
+          # its own volume/image and clashes on container_name bess-edge.
+          docker compose -p bess-edge up -d --build
       - name: Health check
         run: |
           sleep 10

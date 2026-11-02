@@ -61,7 +61,7 @@
         {
           "refId": "A",
           "datasource": "InfluxDB-BESS",
-          "query": "from(bucket:\"telemetry\") |> range(start: -5m) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"battery_soc_pct\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> last()"
+          "query": "from(bucket:\"telemetry\") |> range(start: -24h, stop: 24h) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"battery_soc_pct\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> group() |> sort(columns: [\"_time\"]) |> last()"
         }
       ]
     },
@@ -89,9 +89,10 @@
         {
           "refId": "A",
           "datasource": "InfluxDB-BESS",
-          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nnow_t = now()\nreal = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"pv_power_w\" and r._time <= now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nforecast = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry_forecast\" and r._field == \"pv_power_w\" and r._time > now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nunion(tables: [real, forecast]) |> set(key: \"_field\", value: \"Сонячні панелі\") |> aggregateWindow(every: 5m, fn: mean)"
+          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nnow_t = now()\nreal = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"pv_power_w\" and r._time <= now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nforecast = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry_forecast\" and r._field == \"pv_power_w\" and r._time > now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nunion(tables: [real, forecast]) |> set(key: \"_field\", value: \"Сонячні панелі\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
         }
-      ]
+      ],
+      "interval": "5m"
     },
     {
       "id": 3,
@@ -113,24 +114,25 @@
         {
           "refId": "A",
           "datasource": "InfluxDB-BESS",
-          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nnow_t = now()\nreal = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"pv_power_w\" and r._time <= now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nforecast = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry_forecast\" and r._field == \"pv_power_w\" and r._time > now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nunion(tables: [real, forecast]) |> set(key: \"_field\", value: \"Сонячні панелі\") |> aggregateWindow(every: 5m, fn: mean)"
+          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nnow_t = now()\nreal = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"pv_power_w\" and r._time <= now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nforecast = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry_forecast\" and r._field == \"pv_power_w\" and r._time > now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nunion(tables: [real, forecast]) |> set(key: \"_field\", value: \"Сонячні панелі\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
         },
         {
           "refId": "B",
           "datasource": "InfluxDB-BESS",
-          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nnow_t = now()\nreal = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"battery_power_w\" and r._time <= now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nforecast = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry_forecast\" and r._field == \"battery_power_w\" and r._time > now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nunion(tables: [real, forecast]) |> set(key: \"_field\", value: \"Батарея (+заряд/-розряд)\") |> aggregateWindow(every: 5m, fn: mean)"
+          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nnow_t = now()\nreal = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"battery_power_w\" and r._time <= now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nforecast = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry_forecast\" and r._field == \"battery_power_w\" and r._time > now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nunion(tables: [real, forecast]) |> set(key: \"_field\", value: \"Батарея (+заряд/-розряд)\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
         },
         {
           "refId": "C",
           "datasource": "InfluxDB-BESS",
-          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nnow_t = now()\nreal = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"grid_power_w\" and r._time <= now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nforecast = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry_forecast\" and r._field == \"grid_power_w\" and r._time > now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nunion(tables: [real, forecast]) |> set(key: \"_field\", value: \"Мережа (+купівля/-продаж)\") |> aggregateWindow(every: 5m, fn: mean)"
+          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nnow_t = now()\nreal = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"grid_power_w\" and r._time <= now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nforecast = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry_forecast\" and r._field == \"grid_power_w\" and r._time > now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nunion(tables: [real, forecast]) |> set(key: \"_field\", value: \"Мережа (+купівля/-продаж)\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
         },
         {
           "refId": "D",
           "datasource": "InfluxDB-BESS",
-          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nnow_t = now()\nreal = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"house_load_w\" and r._time <= now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nforecast = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry_forecast\" and r._field == \"house_load_w\" and r._time > now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nunion(tables: [real, forecast]) |> set(key: \"_field\", value: \"Навантаження будинку\") |> aggregateWindow(every: 5m, fn: mean)"
+          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nnow_t = now()\nreal = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"house_load_w\" and r._time <= now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nforecast = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry_forecast\" and r._field == \"house_load_w\" and r._time > now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nunion(tables: [real, forecast]) |> set(key: \"_field\", value: \"Навантаження будинку\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
         }
-      ]
+      ],
+      "interval": "5m"
     },
     {
       "id": 4,
@@ -167,10 +169,11 @@
         {
           "refId": "A",
           "datasource": "InfluxDB-BESS",
-          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nnow_t = now()\nreal = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"battery_temp_c\" and r._time <= now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nforecast = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry_forecast\" and r._field == \"battery_temp_c\" and r._time > now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nunion(tables: [real, forecast]) |> set(key: \"_field\", value: \"Температура батареї\") |> aggregateWindow(every: 5m, fn: mean)"
+          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nnow_t = now()\nreal = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"battery_temp_c\" and r._time <= now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nforecast = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry_forecast\" and r._field == \"battery_temp_c\" and r._time > now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nunion(tables: [real, forecast]) |> set(key: \"_field\", value: \"Температура батареї\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
         }
       ],
-      "description": " Дані до поточного моменту — фактична телеметрія; далі в майбутнє — прогнозована проекція (пунктиром не позначено, але походить з окремого виміру telemetry_forecast)."
+      "description": " Дані до поточного моменту — фактична телеметрія; далі в майбутнє — прогнозована проекція (пунктиром не позначено, але походить з окремого виміру telemetry_forecast).",
+      "interval": "5m"
     },
     {
       "id": 5,
@@ -194,9 +197,10 @@
         {
           "refId": "A",
           "datasource": "InfluxDB-BESS",
-          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nnow_t = now()\nreal = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"grid_voltage_v\" and r._time <= now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nforecast = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry_forecast\" and r._field == \"grid_voltage_v\" and r._time > now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nunion(tables: [real, forecast]) |> set(key: \"_field\", value: \"Напруга мережі\") |> aggregateWindow(every: 5m, fn: mean)"
+          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nnow_t = now()\nreal = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"grid_voltage_v\" and r._time <= now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nforecast = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry_forecast\" and r._field == \"grid_voltage_v\" and r._time > now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nunion(tables: [real, forecast]) |> set(key: \"_field\", value: \"Напруга мережі\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
         }
-      ]
+      ],
+      "interval": "5m"
     },
     {
       "id": 6,
