@@ -1,0 +1,13 @@
+[Unit]
+Description=Force an NTP clock re-step (works around timesyncd not stepping after host suspend)
+After=network-online.target
+
+[Service]
+Type=oneshot
+# systemd-timesyncd slews rather than steps once it already considers itself
+# synchronised, so a guest that resumes from a host suspend many hours behind
+# can stay behind for a very long time. Toggling NTP off and on forces
+# timesyncd to restart and take a fresh step, which is what actually corrects
+# a large offset. This is the automated form of the manual fix that was
+# previously required after every suspend/resume cycle of the host laptop.
+ExecStart=/bin/sh -c '/usr/bin/timedatectl set-ntp false && /usr/bin/timedatectl set-ntp true'

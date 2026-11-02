@@ -1,0 +1,11 @@
+[Unit]
+Description=Check BESS container health every 5 minutes
+
+[Timer]
+# Monotonic, like bess-timesync.timer: fires on real elapsed time even
+# right after a host suspend has thrown the wall clock off.
+OnBootSec=5min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target

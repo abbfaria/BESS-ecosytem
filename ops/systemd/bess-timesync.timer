@@ -1,0 +1,14 @@
+[Unit]
+Description=Periodically force an NTP clock re-step (bounds post-suspend clock drift)
+
+[Timer]
+# Monotonic triggers, so the first firing after a resume happens within
+# OnUnitActiveSec of real elapsed time no matter how far the wall clock has
+# drifted. This bounds drift to ~2 minutes, which keeps the edge's
+# day-boundary logic and the cloud's backfill window anchored to real time.
+OnBootSec=20s
+OnUnitActiveSec=2min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

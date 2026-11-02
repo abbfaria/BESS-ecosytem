@@ -1,0 +1,11 @@
+[Unit]
+Description=Prune old Docker build cache and dangling images
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+# Every CI deploy rebuilds with --build; left alone the cache reached
+# 6.9 GB in two months on the cloud VM (82% disk).
+ExecStart=/usr/bin/docker builder prune -f --filter until=168h
+ExecStart=/usr/bin/docker image prune -f
