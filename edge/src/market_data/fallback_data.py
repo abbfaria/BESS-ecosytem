@@ -17,7 +17,7 @@ import random
 from datetime import date
 from typing import Optional
 
-from .timebase import local_hours_to_utc
+from .timebase import local_hours_to_utc, local_period_wall_hours
 
 # Typical price profiles by hour (UAH/MWh, 24 values)
 _WEEKDAY_SUMMER = [
@@ -94,6 +94,9 @@ def get_fallback_prices(for_date: Optional[date] = None) -> list[float]:
     for base in profile:
         noise = random.uniform(-0.12, 0.18)   # slight positive skew (spike risk)
         prices.append(round(max(500.0, base * (1 + noise)), 1))
+
+    # Lay the wall-clock profile over the day's real 23/24/25 periods.
+    prices = [prices[h] for h in local_period_wall_hours(for_date)]
 
     # The profiles above are written in Kyiv local hours (their comments name
     # local-time peaks), matching how the market publishes. Callers index by

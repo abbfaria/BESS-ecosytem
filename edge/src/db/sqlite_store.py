@@ -216,6 +216,19 @@ class SQLiteStore:
         return float(row[0]) if row else None
 
     @_synchronized
+    def get_dam_prices(self, valid_date: str) -> Optional[list[float]]:
+        """The complete real (non-static) 24h curve stored for `valid_date`,
+        or None if there is none."""
+        rows = self._conn.execute(
+            "SELECT hour, price_uah_mwh FROM dam_prices"
+            " WHERE valid_date = ? AND source != 'static' ORDER BY hour ASC",
+            (valid_date,),
+        ).fetchall()
+        if len(rows) != 24:
+            return None
+        return [float(p) for _, p in rows]
+
+    @_synchronized
     def get_real_price_history(self, max_days: int = 14) -> list[list[float]]:
         """Return up to `max_days` most recent *real* (non-static) 24h curves,
         most recent first — used to build a data-driven fallback curve."""

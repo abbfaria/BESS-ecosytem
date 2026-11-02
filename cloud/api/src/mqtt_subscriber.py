@@ -27,6 +27,7 @@ _STATUS_RE    = re.compile(r"^bess/([^/]+)/status$")
 _FAULT_RE     = re.compile(r"^bess/([^/]+)/fault$")
 _LWT_RE       = re.compile(r"^bess/([^/]+)/lwt$")
 _SCHEDULE_RE  = re.compile(r"^bess/([^/]+)/schedule$")
+_CMD_ACK_RE   = re.compile(r"^bess/([^/]+)/cmd_ack$")
 
 TelemetryCallback = Callable[[str, dict], Awaitable[None]]
 
@@ -40,6 +41,7 @@ class MQTTSubscriber:
         on_status:    TelemetryCallback,
         on_fault:     TelemetryCallback,
         on_schedule:  Optional[TelemetryCallback] = None,
+        on_cmd_ack:   Optional[TelemetryCallback] = None,
     ) -> None:
         self._host         = host
         self._port         = port
@@ -47,6 +49,9 @@ class MQTTSubscriber:
         self._on_status    = on_status
         self._on_fault     = on_fault
         self._on_schedule  = on_schedule
+        self._on_cmd_ack   = on_cmd_ack
+        # Last command acknowledgement per device, for the REST API.
+        self.last_acks: dict[str, dict] = {}
         self._connected    = False
         self._running      = False
         self._client        = None
@@ -90,6 +95,7 @@ class MQTTSubscriber:
             await client.subscribe("bess/+/lwt",       qos=1)
             await client.subscribe("bess/+/buffer_stats", qos=1)
             await client.subscribe("bess/+/schedule",  qos=1)
+            await client.subscribe("bess/+/cmd_ack",   qos=1)
 
             try:
                 async for message in client.messages:
@@ -130,7 +136,19 @@ class MQTTSubscriber:
 
         m = _LWT_RE.match(topic)
         if m:
-            log.warning("LWT received — device offline", device_id=m.group(1))
+            if data.get("status") == "online":
+                log.info("Device online", device_id=m.group(1))
+            else:
+                log.warning("LWT received — device offline", device_id=m.group(1))
+            return
+
+        m = _CMD_ACK_RE.match(topic)
+        if m:
+            self.last_acks[m.group(1)] = data
+            log.info("Command acknowledged", device_id=m.group(1),
+                     cmd_id=data.get("cmd_id"), accepted=data.get("accepted"))
+            if self._on_cmd_ack:
+                await self._on_cmd_ack(m.group(1), data)
             return
 
         m = _SCHEDULE_RE.match(topic)
@@ -138,7 +156,8 @@ class MQTTSubscriber:
             await self._on_schedule(m.group(1), data)
             return
 
-    async def publish(self, topic: str, payload: str, qos: int = 1) -> bool:
+    async def publish(self, topic: str, payload: str, qos: int = 1,
+                      retain: bool = False) -> bool:
         """Publish a downlink (e.g. a fetched market price curve) to edge
         devices. Best-effort: returns False (and logs) if not currently
         connected, rather than raising — callers treat this as one signal
@@ -147,7 +166,7 @@ class MQTTSubscriber:
             log.warning("Cannot publish — MQTT subscriber not connected", topic=topic)
             return False
         try:
-            await self._client.publish(topic, payload=payload, qos=qos)
+            await self._client.publish(topic, payload=payload, qos=qos, retain=retain)
             return True
         except Exception as exc:
             log.error("MQTT publish failed", topic=topic, exc=str(exc))

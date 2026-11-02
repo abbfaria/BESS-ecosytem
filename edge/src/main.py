@@ -100,6 +100,12 @@ class EdgeOrchestrator:
         # by date so that rolling into a new day always retries at once
         # instead of serving out the previous day's backoff.
         self._last_schedule_attempt: Optional[tuple[str, float]] = None
+        # Same rate limit for the daily computation of tomorrow's schedule.
+        self._last_tomorrow_attempt: Optional[tuple[str, float]] = None
+        # Monotonic deadline of an operator override (cloud /cmd or local
+        # API). While it runs the schedule loop must not re-apply the hourly
+        # plan — it used to, every 60 s, so an override lasted a minute.
+        self._override_until: Optional[float] = None
 
     async def run(self) -> None:
         self._running = True
@@ -269,6 +275,10 @@ class EdgeOrchestrator:
         while self._running:
             try:
                 await self._ensure_today_schedule()
+                if self._override_active():
+                    await asyncio.sleep(min(60.0, max(1.0, self._override_until - time.monotonic())))
+                    continue
+                self._override_until = None
                 latest = self._store.get_latest_telemetry(1)
                 soc = latest[0].get("battery_soc_pct") if latest else None
                 action = self._fallback.get_current_action(soc_pct=soc)
@@ -308,30 +318,37 @@ class EdgeOrchestrator:
     # ── Market data loop ───────────────────────────────────────────────────────
 
     async def _market_loop(self) -> None:
-        log.info("Market loop started (runs daily at 14:00 UTC)")
+        """Make sure tomorrow has a schedule once D+1 prices are due.
+
+        Polls the wall clock once a minute instead of sleeping straight
+        through to 14:05 UTC. asyncio.sleep() runs on the monotonic clock,
+        which stops while the host is suspended, so a single long sleep fired
+        hours late (or on the wrong day) after every suspend.
+
+        It also only acts when tomorrow has *no* schedule yet. Unconditionally
+        recomputing at 14:05 replaced the real-price schedule the cloud's
+        13:30 push had produced with one built on whatever this node could
+        fetch itself — in practice the 14-day average.
+        """
+        log.info("Market loop started (ensures tomorrow's schedule from 14:05 UTC)")
         while self._running:
             try:
                 now = datetime.now(timezone.utc)
-                # Ukrainian DAM publishes D+1 prices around 13:00–14:00 UTC
-                target_hour = 14
-                next_run = now.replace(
-                    hour=target_hour, minute=5, second=0, microsecond=0
-                )
-                if now >= next_run:
-                    next_run += timedelta(days=1)
-                sleep_s = (next_run - now).total_seconds()
-                log.info("Market loop sleeping", next_run=next_run.isoformat(),
-                         sleep_h=round(sleep_s / 3600, 1))
-                await asyncio.sleep(sleep_s)
-
-                tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).date()
-                prices   = await self._dam.get_prices(for_date=tomorrow)
-                self._prices_today = prices
-                await self._run_optimizer_and_publish(prices, tomorrow.isoformat())
-
+                if (now.hour, now.minute) >= (14, 5):
+                    tomorrow = (now + timedelta(days=1)).date().isoformat()
+                    if not self._fallback.has_schedule_for(tomorrow):
+                        now_mono = time.monotonic()
+                        last = self._last_tomorrow_attempt
+                        if (last is None or last[0] != tomorrow
+                                or now_mono - last[1] >= _SCHEDULE_RETRY_S):
+                            self._last_tomorrow_attempt = (tomorrow, now_mono)
+                            prices = await self._dam.get_prices(
+                                for_date=date.fromisoformat(tomorrow))
+                            self._prices_today = prices
+                            await self._run_optimizer_and_publish(prices, tomorrow)
             except Exception as exc:
                 log.error("Market loop error", exc=str(exc))
-                await asyncio.sleep(300)
+            await asyncio.sleep(60)
 
     async def _run_optimizer_and_publish(
         self, prices: list[float], valid_date: str
@@ -353,9 +370,13 @@ class EdgeOrchestrator:
         # schedule is optimised against the conditions it will actually meet
         # (see BESSOptimizer.optimize on why the load has to be in the model).
         gen_kw, load_kw = self._emulator.forecast_day(date.fromisoformat(valid_date))
+        now = datetime.now(timezone.utc)
+        # For today the present SoC is the SoC *now*, not at midnight.
+        start_hour = now.hour if valid_date == now.date().isoformat() else 0
         actions = self._optimizer.optimize(prices, soc,
                                            gen_forecast_kw=gen_kw,
-                                           load_forecast_kw=load_kw)
+                                           load_forecast_kw=load_kw,
+                                           start_hour=start_hour)
         self._fallback.save_schedule(actions, valid_date)
 
         schedule_payload = {
@@ -448,7 +469,8 @@ class EdgeOrchestrator:
             if topic.endswith("/schedule"):
                 self._apply_remote_schedule(data)
             elif topic.endswith("/cmd"):
-                self._apply_command(data)
+                ack = self._apply_command(data)
+                await self._mqtt.publish(_topic("cmd_ack"), json.dumps(ack), qos=1)
             elif topic.endswith("/market"):
                 await self._apply_market_push(data)
         except Exception as exc:
@@ -456,6 +478,13 @@ class EdgeOrchestrator:
 
     def _apply_remote_schedule(self, data: dict) -> None:
         from .control.optimizer import HourlyAction
+        valid_date = data.get("valid_date", "")
+        # The schedule topic is shared with this node's own uplink, so the
+        # broker hands every published schedule straight back. Re-applying
+        # that echo is pointless at best, and a delayed replay of an older
+        # one would overwrite the schedule computed since.
+        if data.get("schedule_id") == f"{DEVICE_ID}-{valid_date}":
+            return
         slots = data.get("slots", [])
         actions = [
             HourlyAction(
@@ -468,22 +497,40 @@ class EdgeOrchestrator:
             )
             for s in slots
         ]
-        valid_date = data.get("valid_date", "")
         if len(actions) == 24:
             self._fallback.save_schedule(actions, valid_date)
             log.info("Remote schedule applied", date=valid_date)
 
-    def _apply_command(self, data: dict) -> None:
+    def _override_active(self) -> bool:
+        return (self._override_until is not None
+                and time.monotonic() < self._override_until)
+
+    def _apply_command(self, data: dict) -> dict:
+        """Apply an operator override and return the acknowledgement."""
         mode     = data.get("mode", "SOLAR_PRIORITY")
-        pwr_pct  = data.get("power_pct", 0.0)
-        dur_min  = data.get("duration_min", 60)
-        if mode in ("GRID_CHARGE",):
+        pwr_pct  = float(data.get("power_pct", 0.0))
+        dur_min  = int(data.get("duration_min", 60))
+        valid    = {"SOLAR_PRIORITY", "GRID_CHARGE", "DISCHARGE_SELL", "BACKUP_MODE", "IDLE"}
+        ack = {
+            "cmd_id":    data.get("cmd_id", ""),
+            "ts":        datetime.now(timezone.utc).isoformat(),
+            "device_id": DEVICE_ID,
+        }
+        if mode not in valid or not (1 <= dur_min <= 1440) or not (0 <= pwr_pct <= 100):
+            log.warning("Command rejected", mode=mode, pwr_pct=pwr_pct, dur_min=dur_min)
+            return {**ack, "accepted": False,
+                    "error_msg": f"invalid command mode={mode} power_pct={pwr_pct} duration_min={dur_min}"}
+        if mode == "GRID_CHARGE":
             self._emulator.set_mode(mode, charge_pct=pwr_pct, duration_min=dur_min)
-        elif mode in ("DISCHARGE_SELL",):
+        elif mode == "DISCHARGE_SELL":
             self._emulator.set_mode(mode, discharge_pct=pwr_pct, duration_min=dur_min)
         else:
             self._emulator.set_mode(mode, duration_min=dur_min)
+        self._override_until = time.monotonic() + dur_min * 60
+        latest = self._store.get_latest_telemetry(1)
         log.info("Command applied", mode=mode, pwr_pct=pwr_pct, dur_min=dur_min)
+        return {**ack, "accepted": True, "achieved_mode": mode,
+                "actual_soc_pct": latest[0].get("battery_soc_pct") if latest else None}
 
     async def _apply_market_push(self, data: dict) -> None:
         """Real DAM prices pushed down from the cloud.
@@ -497,10 +544,15 @@ class EdgeOrchestrator:
                         slots=len(prices))
             return
 
-        self._prices_today = prices
         valid_date = data.get("valid_date") or (
             datetime.now(timezone.utc) + timedelta(days=1)
         ).date().isoformat()
+        # The cloud publishes this retained, so it is redelivered on every
+        # reconnect — possibly days later. A past day needs no schedule.
+        if valid_date < datetime.now(timezone.utc).date().isoformat():
+            log.info("Ignoring market push for a past day", date=valid_date)
+            return
+        self._prices_today = prices
         # Real prices fetched by the cloud's headless-browser scraper
         # (see cloud/api/src/market_fetcher.py) — cache for the
         # DAMClient's history-based fallback.

@@ -17,7 +17,7 @@ import asyncio
 import math
 import random
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from ..sensors.models import EmulatorConfig, SensorSnapshot
@@ -69,10 +69,14 @@ class BESSEmulator:
         self._grid_fault_timer = 0.0   # seconds until fault clears
 
         # ── Weather / environment ─────────────────────────────────────
-        self._cloud_cover    = 0.2     # 0=clear, 1=overcast
+        self._cloud_cover    = 0.3     # 0=clear, 1=overcast
+        self._cloud_tau_s    = 3600.0  # cloud-cover correlation time
+        self._cloud_sd       = 0.2     # stationary std. dev. of cloud cover
         self._wind_speed_ms  = 5.0     # m/s
-        self._wind_ou_theta  = 0.1     # OU mean-reversion speed
-        self._wind_ou_sigma  = 0.8     # OU diffusion
+        # Wind speed is an Ornstein-Uhlenbeck process, parameterised by its
+        # correlation time and stationary spread rather than raw theta/sigma.
+        self._wind_ou_tau_s  = 1800.0  # gusts decorrelate over ~30 min
+        self._wind_ou_sd     = 1.8     # m/s, stationary std. dev.
         self._wind_ou_mu     = 5.0     # OU long-term mean
 
         # ── Accumulators ────────────────────────────────────────────
@@ -101,6 +105,10 @@ class BESSEmulator:
         if duration_min > 0:
             self._override_until = time.monotonic() + duration_min * 60
         log.info("Mode set", mode=mode, charge=charge_pct, discharge=discharge_pct)
+
+    def set_soc(self, soc_pct: float) -> None:
+        """Place the pack at a given state of charge (forecast anchoring)."""
+        self._soc_pct = max(0.0, min(100.0, float(soc_pct)))
 
     def force_mode(self, mode: str, charge_pct: float = 0.0,
                     discharge_pct: float = 0.0) -> None:
@@ -278,13 +286,20 @@ class BESSEmulator:
 
         Indexed by UTC hour so it lines up with the price curve the
         optimizer receives (see market_data.timebase).
+
+        Each value is the *mean* over its hour (5-minute sub-samples), the
+        quantity a 1-hour MILP slot actually trades. Sampling the instant at
+        hh:00 instead biased every slot by half an hour of curve slope and
+        overstated planned revenue by ~2.5 % against a noise-free replay.
         """
         wind_kw = self._wind_power_expected() / 1000.0
         gen, load = [], []
         for h in range(24):
             at = datetime(day.year, day.month, day.day, h, tzinfo=timezone.utc)
-            gen.append(self._pv_power_expected(at) / 1000.0 + wind_kw)
-            load.append(self._house_load_expected(at) / 1000.0)
+            subs = [at + timedelta(minutes=m) for m in range(2, 60, 5)]
+            gen.append(sum(self._pv_power_expected(t) for t in subs) / len(subs) / 1000.0
+                       + wind_kw)
+            load.append(sum(self._house_load_expected(t) for t in subs) / len(subs) / 1000.0)
         return gen, load
 
     def _compute_dispatch(self, pv_w: float, wind_w: float,
@@ -410,20 +425,30 @@ class BESSEmulator:
             self._set_fault(FAULT_THERMAL, False)
 
     def _evolve_weather(self, dt_s: float) -> None:
-        """Slow random walk for cloud cover; OU process for wind speed."""
-        # Cloud cover: slow mean-reverting walk
-        mu_cloud = 0.3   # 30% typical overcast
-        self._cloud_cover += (mu_cloud - self._cloud_cover) * dt_s / 3600.0
-        self._cloud_cover += random.gauss(0, 0.01) * math.sqrt(dt_s)
-        self._cloud_cover  = max(0.0, min(1.0, self._cloud_cover))
+        """Mean-reverting (Ornstein-Uhlenbeck) cloud cover and wind speed.
 
-        # Wind speed: Ornstein-Uhlenbeck
-        dW = random.gauss(0, 1) * math.sqrt(dt_s)
-        self._wind_speed_ms += (
-            self._wind_ou_theta * (self._wind_ou_mu - self._wind_speed_ms) * dt_s
-            + self._wind_ou_sigma * dW
-        )
+        Both use the exact OU transition rather than an Euler step. The Euler
+        form x += theta*(mu-x)*dt is only stable for theta*dt < 2; with the
+        old wind theta of 0.1/s that already failed beyond 20 s, so the
+        history backfill (300 s ticks) and forecast (900 s) produced wind
+        speeds with a median of ~59 m/s alternating in sign, i.e. almost no
+        wind generation in any synthetic day. The exact step is stable and
+        statistically identical for every dt.
+        """
+        self._cloud_cover = self._ou_step(self._cloud_cover, 0.3,
+                                          self._cloud_tau_s, self._cloud_sd, dt_s)
+        self._cloud_cover = max(0.0, min(1.0, self._cloud_cover))
+
+        self._wind_speed_ms = self._ou_step(self._wind_speed_ms, self._wind_ou_mu,
+                                            self._wind_ou_tau_s, self._wind_ou_sd, dt_s)
         self._wind_speed_ms = max(0.0, self._wind_speed_ms)
+
+    @staticmethod
+    def _ou_step(x: float, mu: float, tau_s: float, sd: float, dt_s: float) -> float:
+        """Exact OU transition over dt_s for correlation time tau_s and
+        stationary standard deviation sd."""
+        a = math.exp(-dt_s / tau_s)
+        return mu + (x - mu) * a + sd * math.sqrt(1.0 - a * a) * random.gauss(0, 1)
 
     def _evolve_grid(self, dt_s: float) -> None:
         """Simulate grid voltage/frequency fluctuations and rare outages."""
@@ -435,12 +460,12 @@ class BESSEmulator:
                 log.info("Grid reconnected after simulated outage")
             return
 
-        # Small fluctuations
-        self._grid_v  += random.gauss(0, 0.3) * math.sqrt(dt_s / 10)
-        self._grid_hz += random.gauss(0, 0.005) * math.sqrt(dt_s / 10)
-        # Mean-revert to nominal
-        self._grid_v  += (220.0 - self._grid_v)  * dt_s / 600
-        self._grid_hz += (50.0  - self._grid_hz) * dt_s / 60
+        # Small mean-reverting fluctuations around nominal (exact OU step —
+        # the Euler form with a 60 s frequency time constant diverged for
+        # dt > 120 s and pinned backfilled frequency at 47.5/52.5 Hz, which
+        # tagged ~99 % of synthetic history as UNSTABLE).
+        self._grid_v  = self._ou_step(self._grid_v,  220.0, 600.0, 2.2,  dt_s)
+        self._grid_hz = self._ou_step(self._grid_hz, 50.0,  60.0,  0.012, dt_s)
         self._grid_v   = max(195.0, min(253.0, self._grid_v))
         self._grid_hz  = max(47.5,  min(52.5,  self._grid_hz))
 

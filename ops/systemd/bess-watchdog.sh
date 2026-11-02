@@ -18,3 +18,12 @@ for c in $(docker ps -a --filter name=bess- --format '{{.Names}}'); do
             docker start "$c" >/dev/null ;;
     esac
 done
+
+# Disk headroom: InfluxDB, Docker images and logs all grow on the root fs.
+# Warn early, and reclaim build cache before it can fill the disk.
+use=$(df --output=pcent / | tail -1 | tr -dc 0-9)
+if [ "${use:-0}" -ge 85 ]; then
+    logger -t bess-watchdog "root filesystem ${use}% full - pruning docker build cache"
+    docker builder prune -f >/dev/null 2>&1 || true
+fi
+

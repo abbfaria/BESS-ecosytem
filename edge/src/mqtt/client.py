@@ -332,6 +332,18 @@ class EdgeMQTTClient:
         if reason_code == 0:
             self._connected = True
             log.info("MQTT connected", broker=self._cfg.host)
+            # The will is retained, so without this the broker keeps telling
+            # every new subscriber "offline" long after the device is back.
+            try:
+                client.publish(
+                    self._cfg.lwt_topic or f"bess/{self._cfg.device_id}/lwt",
+                    json.dumps({"ts": datetime.now(timezone.utc).isoformat(),
+                                "device_id": self._cfg.device_id,
+                                "status": "online"}),
+                    qos=1, retain=True,
+                )
+            except Exception as exc:
+                log.warning("Could not publish online status", exc=str(exc))
             # Re-apply subscriptions here rather than from the monitor loop:
             # the broker drops them on every disconnect, and doing it in the
             # callback closes the window where a downlink could be missed.

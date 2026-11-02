@@ -15,7 +15,7 @@ import json
 import os
 import signal
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import AsyncIterator
 
 from fastapi import FastAPI, HTTPException
@@ -120,43 +120,69 @@ async def _backfill_history_task() -> None:
         await asyncio.sleep(BACKFILL_INTERVAL_S)
 
 
-async def _market_fetch_loop() -> None:
-    """Daily: fetch tomorrow's real DAM prices from oree.com.ua, store them,
-    and push them down to edge devices over MQTT. Retries every 15 minutes
-    within the day if tomorrow's prices aren't published yet."""
-    while True:
-        now = datetime.now(timezone.utc)
-        next_run = now.replace(hour=MARKET_FETCH_HOUR_UTC, minute=MARKET_FETCH_MINUTE_UTC,
-                                second=0, microsecond=0)
-        if now >= next_run:
-            next_run += timedelta(days=1)
-        await asyncio.sleep((next_run - now).total_seconds())
+async def _publish_market(day_iso: str, prices: list[float]) -> bool:
+    """Push a price curve to every device, *retained*. A device that is
+    offline at push time — routine on a laptop testbed — receives the latest
+    curve as soon as it reconnects, instead of losing it and running the
+    next day on its 14-day average."""
+    if not _subscriber:
+        return False
+    payload = json.dumps({
+        "valid_date": day_iso,
+        "prices": [{"price_uah_mwh": p} for p in prices],
+    })
+    ok = True
+    for device_id in MARKET_PUSH_DEVICE_IDS:
+        ok &= await _subscriber.publish(f"bess/{device_id}/market", payload,
+                                        qos=1, retain=True)
+    return ok
 
-        tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).date()
-        for attempt in range(1, 9):   # give up after ~2h of retrying that day
-            prices = await fetch_dam_prices(tomorrow)
-            if prices is not None:
-                log.info("Real DAM prices fetched from oree.com.ua",
-                         date=tomorrow.isoformat(), attempt=attempt,
-                         min=min(prices), max=max(prices))
-                if _writer:
-                    await _writer.write_market_price(
-                        "fleet", tomorrow.isoformat(), prices, "oree"
-                    )
-                if _subscriber:
-                    payload = json.dumps({
-                        "valid_date": tomorrow.isoformat(),
-                        "prices": [{"price_uah_mwh": p} for p in prices],
-                    })
-                    for device_id in MARKET_PUSH_DEVICE_IDS:
-                        await _subscriber.publish(f"bess/{device_id}/market", payload, qos=1)
-                break
-            log.warning("oree.com.ua fetch returned no data, will retry",
-                        date=tomorrow.isoformat(), attempt=attempt)
-            await asyncio.sleep(MARKET_FETCH_RETRY_S)
-        else:
-            log.error("Gave up fetching real DAM prices for the day",
-                      date=tomorrow.isoformat())
+
+async def _market_fetch_loop() -> None:
+    """Fetch tomorrow's real DAM prices once they are due, store them, and
+    push them to the devices.
+
+    Driven by the wall clock, polled every minute. The previous version
+    slept on asyncio's monotonic clock until 13:30, which stands still while
+    the host is suspended, so after a suspend it fired hours late — or, if
+    the sleep spanned midnight, asked for the wrong day and gave up after
+    two hours. Now it simply keeps trying (every MARKET_FETCH_RETRY_S) from
+    13:30 UTC until the day's curve is in, and retries the MQTT push too.
+    """
+    fetched: dict[str, list[float]] = {}   # date -> prices
+    pushed: set[str] = set()
+    last_try: dict[str, float] = {}
+    loop = asyncio.get_running_loop()
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            due = (now.hour, now.minute) >= (MARKET_FETCH_HOUR_UTC, MARKET_FETCH_MINUTE_UTC)
+            tomorrow = (now + timedelta(days=1)).date().isoformat()
+            if due and tomorrow not in fetched and \
+                    loop.time() - last_try.get(tomorrow, -1e9) >= MARKET_FETCH_RETRY_S:
+                last_try[tomorrow] = loop.time()
+                prices = await fetch_dam_prices(date.fromisoformat(tomorrow))
+                if prices is None:
+                    log.warning("oree.com.ua has no prices for tomorrow yet, will retry",
+                                date=tomorrow, retry_in_min=MARKET_FETCH_RETRY_S // 60)
+                else:
+                    log.info("Real DAM prices fetched from oree.com.ua",
+                             date=tomorrow, min=min(prices), max=max(prices))
+                    fetched[tomorrow] = prices
+                    if _writer:
+                        for device_id in MARKET_PUSH_DEVICE_IDS:
+                            await _writer.write_market_price(device_id, tomorrow, prices, "oree")
+            for day_iso, prices in fetched.items():
+                if day_iso not in pushed and await _publish_market(day_iso, prices):
+                    pushed.add(day_iso)
+                    log.info("Market prices pushed to devices", date=day_iso)
+            # Forget days that are over.
+            today = now.date().isoformat()
+            for d in [d for d in fetched if d < today]:
+                fetched.pop(d); pushed.discard(d); last_try.pop(d, None)
+        except Exception as exc:
+            log.error("Market fetch loop error", exc=str(exc))
+        await asyncio.sleep(60)
 
 
 @asynccontextmanager
@@ -188,6 +214,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         on_status=_writer.write_status,
         on_fault=_writer.write_fault,
         on_schedule=_writer.write_schedule,
+        on_cmd_ack=_writer.write_cmd_ack,
     )
     _subscriber_task = asyncio.create_task(_subscriber.run(), name="mqtt-subscriber")
     _market_task = asyncio.create_task(_market_fetch_loop(), name="market-fetcher")

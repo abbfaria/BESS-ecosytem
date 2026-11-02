@@ -23,7 +23,7 @@ from datetime import date
 from typing import Optional
 
 from .logging_config import get_logger
-from edge_src.market_data.timebase import local_hours_to_utc
+from edge_src.market_data.timebase import local_day_hours, local_hours_to_utc
 
 log = get_logger(__name__)
 
@@ -148,8 +148,11 @@ async def _read_row(page, target: str, for_date: date):
         cells = await row.locator("td").all_inner_texts()
         if not cells or cells[0].strip() != target:
             continue
-        values = cells[1:25]
-        if len(values) != 24:
+        # 24 delivery hours normally, 23/25 on the DST-change days; a fixed
+        # cells[1:25] silently dropped the 25th hour and shifted the rest.
+        n = local_day_hours(for_date)
+        values = [v for v in cells[1:] if v.strip()][:n]
+        if len(values) != n:
             log.warning("oree.com.ua row has unexpected cell count",
                         date=target, cells=len(values))
             return None

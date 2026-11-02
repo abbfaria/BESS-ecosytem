@@ -88,8 +88,16 @@ class BESSOptimizer:
         current_soc_pct: float,
         gen_forecast_kw:  Optional[list[float]] = None,
         load_forecast_kw: Optional[list[float]] = None,
+        start_hour: int = 0,
     ) -> list[HourlyAction]:
         """Return 24 HourlyAction objects for the next day.
+
+        `start_hour` is the first hour the plan can still act on, with
+        `current_soc_pct` being the state of charge at that hour. A schedule
+        computed for *today* after a restart used to start from hour 0 with
+        the present SoC, i.e. plan charging into hours that had already
+        passed and discharging energy that was never stored. Hours before
+        `start_hour` are now held at zero battery power.
 
         Supplying both forecasts (24 UTC-indexed hourly values, in kW)
         switches the objective from pure battery arbitrage to the site's
@@ -122,6 +130,7 @@ class BESSOptimizer:
                     prices_uah_mwh, current_soc_pct,
                     gen_forecast_kw if co_opt else None,
                     load_forecast_kw if co_opt else None,
+                    start_hour=start_hour,
                 )
                 # _milp_optimize sets last_method itself — either to the
                 # variant it solved ("milp-v1" / "milp-netflow-v2") or to
@@ -132,7 +141,7 @@ class BESSOptimizer:
                 log.warning("MILP failed, falling back to greedy", exc=str(exc))
 
         self.last_method = "greedy-v1"
-        return self._greedy_optimize(prices_uah_mwh, current_soc_pct)
+        return self._greedy_optimize(prices_uah_mwh, current_soc_pct, start_hour)
 
     # ── MILP optimizer ────────────────────────────────────────────────────────
 
@@ -142,6 +151,7 @@ class BESSOptimizer:
         soc0: float,
         gen:  Optional[list[float]] = None,
         load: Optional[list[float]] = None,
+        start_hour: int = 0,
     ) -> list[HourlyAction]:
         cfg = self._cfg
         cap  = cfg.battery_capacity_kwh
@@ -188,12 +198,20 @@ class BESSOptimizer:
             )
         prob += revenue
 
-        # SoC dynamics (initial SoC)
-        soc_init = soc0 / 100.0 * cap
+        # SoC dynamics (initial SoC). Clamped into the operating window: the
+        # pack can sit a little outside it (self-discharge below soc_min),
+        # and with the hours before start_hour frozen that would otherwise
+        # make the whole model infeasible.
+        soc_init = min(max(soc0 / 100.0 * cap, soc_lo), soc_hi)
         prob += soc[0] == soc_init + eta_c * p_chg[0] - p_dis[0] * inv_eta_d
 
         for h in range(1, 24):
             prob += soc[h] == soc[h-1] + eta_c * p_chg[h] - p_dis[h] * inv_eta_d
+
+        # Hours already elapsed cannot be acted on any more.
+        for h in range(min(max(start_hour, 0), 24)):
+            prob += p_chg[h] == 0
+            prob += p_dis[h] == 0
 
         # Mutual exclusion and power limits
         M = max(p_chg_max, p_dis_max) + 1
@@ -219,7 +237,7 @@ class BESSOptimizer:
             log.warning("MILP infeasible/no solution — falling back to greedy",
                         status=prob.status)
             self.last_method = "greedy-v1"
-            return self._greedy_optimize(prices, soc0)
+            return self._greedy_optimize(prices, soc0, start_hour)
 
         actions = []
         for h in range(24):
@@ -239,7 +257,13 @@ class BESSOptimizer:
                 dis_pct = 0.0
                 chg_pct = chg / p_chg_max * 100.0
             else:
-                mode = "SOLAR_PRIORITY"
+                # In the net-flow model "no battery power" really means zero:
+                # grid = load - gen for that hour. SOLAR_PRIORITY would let
+                # the inverter charge/discharge on its own, which the plan
+                # never accounted for — the executed SoC drifted ~11 pp from
+                # the planned one. The arbitrage-only model doesn't model
+                # the house at all, so self-consumption stays right there.
+                mode = "IDLE" if co_opt else "SOLAR_PRIORITY"
                 chg_pct = dis_pct = 0.0
 
             actions.append(HourlyAction(
@@ -266,6 +290,7 @@ class BESSOptimizer:
         self,
         prices: list[float],
         soc0: float,
+        start_hour: int = 0,
     ) -> list[HourlyAction]:
         """
         Rank hours by price. Cheapest N hours → charge, most expensive M → discharge.
@@ -290,7 +315,9 @@ class BESSOptimizer:
 
         actions = []
         for h in range(24):
-            if h in low_hours and soc < soc_hi:
+            if h < start_hour:
+                actions.append(HourlyAction(h, "SOLAR_PRIORITY", price_uah_mwh=prices[h]))
+            elif h in low_hours and soc < soc_hi:
                 energy_room = (soc_hi - soc) / 100.0 * cap
                 chg_kwh = min(p_max * eta_c, energy_room)
                 soc += chg_kwh / cap * 100.0

@@ -106,7 +106,8 @@ class InfluxWriter:
         except Exception as exc:
             log.error("InfluxDB write_telemetry_forecast error", exc=str(exc))
 
-    async def write_schedule(self, device_id: str, data: dict) -> None:
+    async def write_schedule(self, device_id: str, data: dict,
+                             producer: str = "edge") -> None:
         """Store the edge's planned 24h dispatch schedule — one point per
         hour, timestamped at that hour's actual UTC start, so it can be
         queried by time range like any other series (e.g. "tomorrow's
@@ -126,6 +127,11 @@ class InfluxWriter:
         don't participate in a point's identity, so a mode change now
         correctly overwrites in place like price_uah_mwh and
         expected_revenue_uah already did.
+
+        `producer` ("edge" for the device's own uplink, "cloud" for the
+        history service's projections) and the power set-points are stored
+        too, so the projection can replay the plan the device really runs
+        and never overwrites it with one of its own.
         """
         if not self._ok:
             return
@@ -144,6 +150,10 @@ class InfluxWriter:
                     .field("mode",                 str(slot.get("mode", "SOLAR_PRIORITY")))
                     .field("price_uah_mwh",       float(slot.get("price_uah_mwh", 0)))
                     .field("expected_revenue_uah", float(slot.get("expected_revenue_uah", 0)))
+                    .field("charge_pct",           float(slot.get("charge_power_pct", 0)))
+                    .field("discharge_pct",        float(slot.get("discharge_power_pct", 0)))
+                    .field("producer",             producer)
+                    .field("price_source",         str(data.get("price_source", "unknown")))
                     .time(ts, WritePrecision.NS)
                 )
             if points:
@@ -213,6 +223,23 @@ class InfluxWriter:
             await self._write.write(bucket=self._bucket, org=self._org, record=p)
         except Exception as exc:
             log.error("InfluxDB write_fault error", exc=str(exc))
+
+    async def write_cmd_ack(self, device_id: str, data: dict) -> None:
+        if not self._ok:
+            return
+        try:
+            p = (
+                Point("cmd_ack")
+                .tag("device_id", device_id)
+                .field("cmd_id",   str(data.get("cmd_id", "")))
+                .field("accepted", int(bool(data.get("accepted", False))))
+                .field("mode",     str(data.get("achieved_mode") or ""))
+                .field("error_msg", str(data.get("error_msg") or ""))
+                .time(data.get("ts") or datetime.now(timezone.utc), WritePrecision.NS)
+            )
+            await self._write.write(bucket=self._bucket, org=self._org, record=p)
+        except Exception as exc:
+            log.error("InfluxDB write_cmd_ack error", exc=str(exc))
 
     async def query(self, flux: str) -> list[dict]:
         """Run a Flux query and return rows as dicts."""

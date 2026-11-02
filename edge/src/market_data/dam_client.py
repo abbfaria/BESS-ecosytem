@@ -33,7 +33,7 @@ except ImportError:
     _AIOHTTP = False
 
 from .fallback_data import get_fallback_prices
-from .timebase import local_hours_to_utc
+from .timebase import local_day_hours, local_hours_to_utc
 from ..utils.logging_config import get_logger
 
 log = get_logger(__name__)
@@ -83,6 +83,18 @@ class DAMClient:
             log.debug("DAM price cache hit", date=key)
             return self._cache[key][0]
 
+        # A curve for exactly this date may already be held locally — above
+        # all the one the cloud pushes every afternoon (_apply_market_push).
+        # It must win over every fetch-or-fallback path below: otherwise the
+        # edge's own 14:05 UTC run, whose direct oree.com.ua request always
+        # comes back empty, fell through to the 14-day *average* and
+        # replaced the real-price schedule computed half an hour earlier.
+        exact = self._stored_curve(key)
+        if exact is not None:
+            self._cache[key] = (exact, time.time() + self._cache_ttl_s)
+            log.info("DAM prices taken from local store", date=key)
+            return exact
+
         source = "oree"
         prices = await self._fetch_oree(for_date)
         if prices is None:
@@ -109,6 +121,15 @@ class DAMClient:
         log.info("DAM prices fetched", date=key, source=source,
                  min=min(prices), max=max(prices))
         return prices
+
+    def _stored_curve(self, key: str) -> Optional[list[float]]:
+        if self._store is None:
+            return None
+        try:
+            return self._store.get_dam_prices(key)
+        except Exception as exc:
+            log.debug("Failed to read stored DAM prices", exc=str(exc))
+            return None
 
     def _fetch_history_fallback(self) -> Optional[list[float]]:
         """Average of this device's own recently *fetched* real curves —
@@ -172,7 +193,7 @@ class DAMClient:
             if not row_match:
                 return None
             cells = re.findall(r">([\d]+\.[\d]+)<", row_match.group(1))
-            if len(cells) != 24:
+            if len(cells) != local_day_hours(for_date):
                 return None
             # Columns are Kyiv local delivery hours — re-index to UTC, which
             # is the convention everything downstream assumes. See timebase.

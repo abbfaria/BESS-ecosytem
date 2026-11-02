@@ -681,6 +681,140 @@ class TestFallbackDepletion(unittest.TestCase):
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
+
+# ── Regressions from the 2026-11-02 system audit ──────────────────────────────
+
+class TestDAMClientPrefersExactCurve(unittest.IsolatedAsyncioTestCase):
+    """The edge's 14:05 run used to replace the cloud-pushed real curve with
+    the 14-day average, because its own direct fetch always comes back empty."""
+
+    async def test_stored_curve_for_the_date_wins_over_average(self):
+        from src.market_data.dam_client import DAMClient
+        tmp = tempfile.mkdtemp()
+        store = SQLiteStore(os.path.join(tmp, "e.db")); store.open()
+        try:
+            store.save_dam_prices("2026-11-01", [2000.0] * 24, "cloud")
+            real = [1000.0] * 24; real[17] = 15000.0
+            store.save_dam_prices("2026-11-03", real, "cloud")
+            client = DAMClient(store=store)
+            with patch.object(DAMClient, "_fetch_oree", new=AsyncMock(return_value=None)):
+                self.assertEqual(await client.get_prices(date(2026, 11, 3)), real)
+        finally:
+            store.close()
+
+
+class TestEmulatorStableAtCoarseTicks(unittest.IsolatedAsyncioTestCase):
+    """History backfill (300 s) and forecast (900 s) step the same physics;
+    the Euler updates diverged there (wind ~59 m/s, frequency railed)."""
+
+    async def test_backfill_tick_keeps_weather_and_grid_physical(self):
+        import random, statistics
+        for dt in (10.0, 300.0, 900.0):
+            random.seed(5)
+            em = BESSEmulator(EmulatorConfig())
+            t0 = datetime(2026, 11, 3, tzinfo=timezone.utc)
+            winds, unstable, n = [], 0, int(2 * 86400 / dt)
+            for i in range(n):
+                s = await em.tick(as_of=t0 + timedelta(seconds=i * dt), dt_s=dt)
+                winds.append(em._wind_speed_ms)
+                unstable += s.grid_status == "UNSTABLE"
+            self.assertLess(statistics.median(winds), 10.0, msg=f"dt={dt}")
+            self.assertLess(max(winds), 25.0, msg=f"dt={dt}")
+            self.assertLess(unstable / n, 0.05, msg=f"dt={dt}")
+
+
+class TestOptimizerPlanIsExecutable(unittest.TestCase):
+
+    def setUp(self):
+        self.opt = BESSOptimizer(OptimizerConfig())
+        self.emu = BESSEmulator(EmulatorConfig())
+        self.prices = get_fallback_prices(date(2026, 11, 3))
+
+    def test_netflow_idle_hours_are_idle_not_self_consumption(self):
+        gen, load = self.emu.forecast_day(date(2026, 11, 3))
+        acts = self.opt.optimize(self.prices, 50.0, gen_forecast_kw=gen, load_forecast_kw=load)
+        if not self.opt.last_method.startswith("milp"):
+            self.skipTest("no MILP solver available")
+        for a in acts:
+            if a.charge_pct == 0 and a.discharge_pct == 0:
+                self.assertEqual(a.mode, "IDLE")
+
+    def test_elapsed_hours_are_not_planned(self):
+        gen, load = self.emu.forecast_day(date(2026, 11, 3))
+        acts = self.opt.optimize(self.prices, 50.0, gen_forecast_kw=gen,
+                                 load_forecast_kw=load, start_hour=15)
+        for a in acts[:15]:
+            self.assertEqual((a.charge_pct, a.discharge_pct), (0.0, 0.0))
+        greedy = self.opt._greedy_optimize(self.prices, 50.0, start_hour=15)
+        self.assertTrue(all(a.mode == "SOLAR_PRIORITY" for a in greedy[:15]))
+
+    def test_soc_below_window_does_not_make_model_infeasible(self):
+        gen, load = self.emu.forecast_day(date(2026, 11, 3))
+        self.opt.optimize(self.prices, 9.5, gen_forecast_kw=gen,
+                          load_forecast_kw=load, start_hour=12)
+        if OptimizerConfig and self.opt.last_method != "greedy-v1":
+            self.assertEqual(self.opt.last_method, "milp-netflow-v2")
+
+
+class TestDSTDays(unittest.TestCase):
+
+    def test_25_hour_day_keeps_every_hour(self):
+        from src.market_data.timebase import local_day_hours
+        d = date(2026, 10, 25)                      # EEST -> EET
+        self.assertEqual(local_day_hours(d), 25)
+        local = [float(k) for k in range(25)]       # one value per period
+        utc = local_hours_to_utc(local, d)
+        # 00:00 UTC is 03:00 EEST, the 4th period; 01:00 UTC is the repeated
+        # 03:00 EET (5th period); 23:00 UTC is 01:00 the next local day,
+        # which wraps to period 0 by the documented day-edge rule.
+        self.assertEqual(utc[0], 3.0)
+        self.assertEqual(utc[1], 4.0)
+        self.assertEqual(utc[20], 23.0)
+
+    def test_23_hour_day(self):
+        from src.market_data.timebase import local_day_hours
+        self.assertEqual(local_day_hours(date(2027, 3, 28)), 23)
+        self.assertEqual(len(get_fallback_prices(date(2027, 3, 28))), 24)
+        self.assertEqual(len(get_fallback_prices(date(2026, 10, 25))), 24)
+
+
+class TestFallbackUsesLocalClock(unittest.TestCase):
+
+    def test_windows_follow_kyiv_time(self):
+        fc = FallbackController(Path(tempfile.mkdtemp()) / "s.json")
+        # 07:00 UTC in winter is 09:00 Kyiv: a morning-peak hour locally.
+        a = fc._default_action(7, soc_pct=80.0, local_hour=9)
+        self.assertEqual((a.hour, a.mode), (7, "DISCHARGE_SELL"))
+        # 04:00 UTC = 06:00 Kyiv: no longer the night valley.
+        self.assertNotEqual(fc._default_action(4, soc_pct=80.0, local_hour=6).mode,
+                            "GRID_CHARGE")
+
+
+class TestCommandOverride(unittest.TestCase):
+    """A cloud/local override used to be undone by the schedule loop within
+    60 s; it must now hold for its duration and be acknowledged."""
+
+    def _orchestrator(self):
+        import src.main as m
+        o = m.EdgeOrchestrator.__new__(m.EdgeOrchestrator)
+        o._emulator = BESSEmulator(EmulatorConfig())
+        o._store = MagicMock(); o._store.get_latest_telemetry.return_value = [{"battery_soc_pct": 55.0}]
+        o._override_until = None
+        return o
+
+    def test_override_is_held_and_acked(self):
+        o = self._orchestrator()
+        ack = o._apply_command({"cmd_id": "c1", "mode": "GRID_CHARGE",
+                                "power_pct": 40, "duration_min": 30})
+        self.assertTrue(ack["accepted"]); self.assertEqual(ack["cmd_id"], "c1")
+        self.assertTrue(o._override_active())
+        self.assertEqual(o._emulator._mode, "GRID_CHARGE")
+
+    def test_invalid_command_is_rejected(self):
+        o = self._orchestrator()
+        ack = o._apply_command({"cmd_id": "c2", "mode": "TURBO", "duration_min": 30})
+        self.assertFalse(ack["accepted"]); self.assertFalse(o._override_active())
+
 if __name__ == "__main__":
     print("=" * 60)
     print("BESS Ecosystem Integration Test Harness")

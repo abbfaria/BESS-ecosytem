@@ -61,7 +61,7 @@ from typing import Optional
 # cleanly if ever run standalone (e.g. a test harness with a different CWD).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from edge_src.control.optimizer import BESSOptimizer, OptimizerConfig       # noqa: E402
+from edge_src.control.optimizer import BESSOptimizer, OptimizerConfig, HourlyAction  # noqa: E402
 from edge_src.control.economics import compute_revenue_uah                  # noqa: E402
 from edge_src.sensors.emulator import BESSEmulator                          # noqa: E402
 from edge_src.sensors.models import EmulatorConfig                          # noqa: E402
@@ -136,15 +136,12 @@ async def ensure_history(writer: InfluxWriter, bucket: str, device_id: str,
         soc = await _replay_day(writer, emulator, device_id, day, schedule, hours=missing)
 
         await writer.write_market_price(device_id, day.isoformat(), prices, source)
-        await writer.write_schedule(device_id, {
-            "valid_date": day.isoformat(),
-            "slots": [
-                {"hour": a.hour, "mode": a.mode,
-                 "price_uah_mwh": a.price_uah_mwh,
-                 "expected_revenue_uah": a.expected_revenue}
-                for a in schedule
-            ],
-        })
+        # Only record this replay plan when the day has none: a partially
+        # covered day normally already holds the schedule the device itself
+        # ran, and the dashboard must keep showing that one.
+        if not await _has_schedule(writer, bucket, device_id, day):
+            await writer.write_schedule(device_id, _schedule_payload(day, schedule, source),
+                                        producer="cloud")
         if len(missing) == 24:
             filled += 1
         else:
@@ -158,6 +155,21 @@ async def ensure_history(writer: InfluxWriter, bucket: str, device_id: str,
              window_start=start.isoformat(), window_end=today.isoformat())
 
     await _ensure_forward(writer, bucket, optimizer, emulator, device_id, today, soc)
+
+
+def _schedule_payload(day: date, schedule: list, price_source: str) -> dict:
+    return {
+        "valid_date": day.isoformat(),
+        "price_source": price_source,
+        "slots": [
+            {"hour": a.hour, "mode": a.mode,
+             "charge_power_pct": a.charge_pct,
+             "discharge_power_pct": a.discharge_pct,
+             "price_uah_mwh": a.price_uah_mwh,
+             "expected_revenue_uah": a.expected_revenue}
+            for a in schedule
+        ],
+    }
 
 
 async def _replay_day(writer: InfluxWriter, emulator: "BESSEmulator", device_id: str,
@@ -253,29 +265,32 @@ async def _ensure_forward(writer: InfluxWriter, bucket: str, optimizer: "BESSOpt
     near_term_upgrade_days = 2   # today + tomorrow: the only days for which
                                   # a same-day real-price upgrade is realistic
 
-    # Anchor the projection to the battery's *actual* current charge.
-    # Without this the forecast was computed once and then kept, so it
-    # drifted arbitrarily far from reality: with the pack sitting at 10%
-    # the stored projection still claimed 96% an hour later — a rise of
-    # 86 points in an hour, when 5 kW into a 20 kWh pack caps the physically
-    # possible rate at about 24 points. Re-anchoring makes the near-term
-    # curve start from where the device really is.
+    # Anchor the projection to the battery's *actual* current charge, at the
+    # current hour. Handing that SoC only to the optimizer (as before) left
+    # the replay itself starting at midnight from whatever state the
+    # emulator happened to hold, so the projected SoC at "now" could sit
+    # 20-40 points away from the measured one and the dashboard line jumped
+    # where actual hands over to forecast.
     actual_soc = await _latest_actual_soc(writer, bucket, device_id)
+    now_hour = datetime.now(timezone.utc).hour
     if actual_soc is not None:
         soc = actual_soc
 
     for offset in range(FORECAST_DAYS):
         d = today + timedelta(days=offset)
+        near_term = offset < near_term_upgrade_days
         has_schedule = await _has_schedule(writer, bucket, device_id, d)
         has_telemetry_fc = await _has_telemetry_forecast(writer, bucket, device_id, d)
-        needs_upgrade = (
-            offset < near_term_upgrade_days and has_schedule
-            and await _price_source(writer, bucket, device_id, d) == "fallback"
-        )
+        producer, sched_price_source = (await _schedule_meta(writer, bucket, device_id, d)
+                                        if has_schedule and near_term else (None, None))
+        # A schedule the device published is authoritative; one this service
+        # wrote is redone once real prices exist for its day.
+        needs_upgrade = (near_term and has_schedule and producer != "edge"
+                         and sched_price_source != "oree")
         # The near-term projection is always rebuilt, never reused: it is the
         # part that viewers actually read ("will it charge this evening?"),
         # and it is the part reality diverges from fastest.
-        if offset < near_term_upgrade_days:
+        if near_term:
             has_telemetry_fc = False
 
         if has_schedule and has_telemetry_fc and not needs_upgrade:
@@ -283,16 +298,22 @@ async def _ensure_forward(writer: InfluxWriter, bucket: str, optimizer: "BESSOpt
             skipped += 1
             continue
 
-        # _prices_for()'s cache check only matches source=="oree", so
-        # calling it again for a fallback-sourced day naturally retries a
-        # real fetch instead of just handing back the same fallback curve
-        # — no separate "upgrade" code path needed to get fresh prices,
-        # just not skipping the day.
+        start_hour = 0
+        if offset == 0 and actual_soc is not None:
+            emulator.set_soc(actual_soc)
+            start_hour = now_hour
+
         prices, source = await _prices_for(writer, bucket, device_id, d)
-        gen_kw, load_kw = emulator.forecast_day(d)
-        schedule = optimizer.optimize(prices, soc,
-                                      gen_forecast_kw=gen_kw,
-                                      load_forecast_kw=load_kw)
+        # Project what the device will actually do: its own schedule when it
+        # has published one, otherwise what the same optimizer would choose.
+        schedule = (await _stored_edge_schedule(writer, bucket, device_id, d)
+                    if near_term and producer == "edge" else None)
+        if schedule is None:
+            gen_kw, load_kw = emulator.forecast_day(d)
+            schedule = optimizer.optimize(prices, soc,
+                                          gen_forecast_kw=gen_kw,
+                                          load_forecast_kw=load_kw,
+                                          start_hour=start_hour)
         upgraded_now = needs_upgrade and source == "oree"
         if upgraded_now:
             upgraded += 1
@@ -301,24 +322,14 @@ async def _ensure_forward(writer: InfluxWriter, bucket: str, optimizer: "BESSOpt
 
         if not has_schedule or upgraded_now:
             await writer.write_market_price(device_id, d.isoformat(), prices, source)
-            await writer.write_schedule(device_id, {
-                "valid_date": d.isoformat(),
-                "slots": [
-                    {"hour": a.hour, "mode": a.mode,
-                     "price_uah_mwh": a.price_uah_mwh,
-                     "expected_revenue_uah": a.expected_revenue}
-                    for a in schedule
-                ],
-            })
+            await writer.write_schedule(device_id, _schedule_payload(d, schedule, source),
+                                        producer="cloud")
 
         if not has_telemetry_fc or upgraded_now:
             soc = await _replay_day(writer, emulator, device_id, d, schedule,
-                                     forecast=True)
+                                     forecast=True,
+                                     hours=set(range(start_hour, 24)) if start_hour else None)
         elif needs_upgrade:
-            # Retried and still only fallback available — nothing rewritten,
-            # but soc must still advance to this day's actual end-of-day
-            # value (from the earlier, still-valid telemetry_forecast) for
-            # the next iteration's optimizer call to stay realistic.
             soc = await _last_known_soc_forecast(writer, bucket, device_id, d, soc)
         filled += 1
 
@@ -389,6 +400,50 @@ from(bucket:"{bucket}")
 '''
     rows = await writer.query(flux)
     return len(rows) > 0
+
+
+async def _schedule_meta(writer: InfluxWriter, bucket: str, device_id: str,
+                         day: date) -> tuple[Optional[str], Optional[str]]:
+    """(producer, price_source) of the schedule stored for `day`, as last
+    written. Points written before these fields existed give (None, None)."""
+    out: dict[str, Optional[str]] = {"producer": None, "price_source": None}
+    for field in out:
+        flux = f'''
+from(bucket:"{bucket}")
+  |> range(start: {day.isoformat()}T00:00:00Z, stop: {(day + timedelta(days=1)).isoformat()}T00:00:00Z)
+  |> filter(fn: (r) => r._measurement == "schedule" and r._field == "{field}" and r.device_id == "{device_id}")
+  |> group()
+  |> sort(columns: ["_time"])
+  |> last()
+'''
+        rows = await writer.query(flux)
+        if rows:
+            out[field] = str(rows[0]["_value"])
+    return out["producer"], out["price_source"]
+
+
+async def _stored_edge_schedule(writer: InfluxWriter, bucket: str, device_id: str,
+                                day: date) -> Optional[list]:
+    """The 24 hourly actions of the device's own published schedule for
+    `day`, or None if it is incomplete or lacks the power set-points."""
+    flux = f'''
+from(bucket:"{bucket}")
+  |> range(start: {day.isoformat()}T00:00:00Z, stop: {(day + timedelta(days=1)).isoformat()}T00:00:00Z)
+  |> filter(fn: (r) => r._measurement == "schedule" and r.device_id == "{device_id}")
+  |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+  |> sort(columns: ["_time"])
+'''
+    rows = await writer.query(flux)
+    if len(rows) != 24 or any("charge_pct" not in r or r.get("charge_pct") is None for r in rows):
+        return None
+    return [
+        HourlyAction(hour=r["_time"].hour, mode=str(r.get("mode") or "IDLE"),
+                     charge_pct=float(r.get("charge_pct") or 0.0),
+                     discharge_pct=float(r.get("discharge_pct") or 0.0),
+                     price_uah_mwh=float(r.get("price_uah_mwh") or 0.0),
+                     expected_revenue=float(r.get("expected_revenue_uah") or 0.0))
+        for r in rows
+    ]
 
 
 async def _price_source(writer: InfluxWriter, bucket: str, device_id: str,

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Optional
 
 from .optimizer import HourlyAction
+from ..market_data.timebase import kyiv_local_hour
 from ..utils.logging_config import get_logger
 
 log = get_logger(__name__)
@@ -146,9 +147,10 @@ class FallbackController:
             log.warning("No stored schedule for today — using rule-based fallback "
                         "until one is computed", today=today,
                         stored_dates=sorted(self._schedules))
-        return self._default_action(hour, soc_pct)
+        return self._default_action(hour, soc_pct, local_hour=int(kyiv_local_hour(now)))
 
-    def _default_action(self, hour: int, soc_pct: Optional[float] = None) -> HourlyAction:
+    def _default_action(self, hour: int, soc_pct: Optional[float] = None,
+                        local_hour: Optional[int] = None) -> HourlyAction:
         """Conservative safe defaults when no schedule is available.
 
         `soc_pct` makes the fallback state-aware. Without it the rule was
@@ -159,6 +161,15 @@ class FallbackController:
         commanding DISCHARGE_SELL into an empty pack, which does nothing
         except keep the low-SoC fault raised.
         """
+        # The windows below are Kyiv clock times (night valley, morning and
+        # evening peaks, midday solar glut); `hour` is the UTC slot index the
+        # returned action belongs to. Matching the windows against the UTC
+        # hour put the "morning peak" discharge on 09-11 local in winter —
+        # the cheapest part of the day.
+        hour_of_action = hour
+        if local_hour is not None:
+            hour = local_hour
+
         # Below this, the pack is treated as needing replenishment before it
         # is allowed to serve another discharge window.
         RESERVE_PCT = 35.0
@@ -168,7 +179,7 @@ class FallbackController:
         # Night valley: always the cheapest window, so always a good time to
         # refill — more so when depleted.
         if 0 <= hour < 6:
-            return HourlyAction(hour=hour, mode="GRID_CHARGE",
+            return HourlyAction(hour=hour_of_action, mode="GRID_CHARGE",
                                 charge_pct=80.0 if depleted else 50.0,
                                 price_uah_mwh=0.0)
 
@@ -177,18 +188,18 @@ class FallbackController:
             if depleted:
                 # Nothing worth selling. Let PV cover the house and bank any
                 # surplus instead of commanding a discharge that cannot run.
-                return HourlyAction(hour=hour, mode="SOLAR_PRIORITY")
-            return HourlyAction(hour=hour, mode="DISCHARGE_SELL",
+                return HourlyAction(hour=hour_of_action, mode="SOLAR_PRIORITY")
+            return HourlyAction(hour=hour_of_action, mode="DISCHARGE_SELL",
                                 discharge_pct=70.0, price_uah_mwh=0.0)
 
         # Daylight hours: if the pack is low, actively top it up from the
         # grid rather than waiting for midnight; PV surplus is used first by
         # the dispatch model either way.
         if depleted and 10 <= hour <= 16:
-            return HourlyAction(hour=hour, mode="GRID_CHARGE",
+            return HourlyAction(hour=hour_of_action, mode="GRID_CHARGE",
                                 charge_pct=60.0, price_uah_mwh=0.0)
 
-        return HourlyAction(hour=hour, mode="SOLAR_PRIORITY")
+        return HourlyAction(hour=hour_of_action, mode="SOLAR_PRIORITY")
 
     def has_schedule_for(self, date_str: str) -> bool:
         """Whether a complete 24-slot schedule is held for that date."""

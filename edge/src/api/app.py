@@ -93,6 +93,7 @@ def create_app(orchestrator: "EdgeOrchestrator") -> FastAPI:
         action = fc.get_current_action()
         return {
             "loaded_date":     fc.loaded_date,
+            "override_active": orchestrator._override_active(),
             "current_hour":    datetime.now(timezone.utc).hour,
             "current_action": {
                 "hour":          action.hour,
@@ -110,12 +111,15 @@ def create_app(orchestrator: "EdgeOrchestrator") -> FastAPI:
                        "BACKUP_MODE", "IDLE"}
         if cmd.mode not in valid_modes:
             raise HTTPException(400, f"Invalid mode. Must be one of: {valid_modes}")
-        orchestrator._apply_command({
+        ack = orchestrator._apply_command({
+            "cmd_id":      f"local-{datetime.now(timezone.utc).timestamp():.0f}",
             "mode":        cmd.mode,
             "power_pct":   cmd.power_pct,
             "duration_min": cmd.duration_min,
         })
-        return {"accepted": True, "mode": cmd.mode, "duration_min": cmd.duration_min}
+        if not ack["accepted"]:
+            raise HTTPException(400, ack.get("error_msg", "command rejected"))
+        return {**ack, "duration_min": cmd.duration_min}
 
     # ── Events ────────────────────────────────────────────────────────────────
 
