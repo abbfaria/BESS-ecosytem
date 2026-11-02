@@ -111,6 +111,16 @@ async def ensure_history(writer: InfluxWriter, bucket: str, device_id: str,
         if day == today:
             missing = {h for h in missing if h < current_hour}
         if not missing:
+            # A day replayed while oree.com.ua was unreachable keeps its
+            # fallback curve forever unless retried here: prices are
+            # otherwise only fetched for days with missing telemetry. The
+            # telemetry stays as replayed; revenue panels prefer "oree".
+            if day < today and await _price_source(writer, bucket, device_id, day) == "fallback":
+                fetched = await fetch_dam_prices(day)
+                if fetched:
+                    await writer.write_market_price(device_id, day.isoformat(), fetched, "oree")
+                    log.info("Past day's prices upgraded from fallback to real",
+                             date=day.isoformat())
             # Still need to know the day's ending SoC to keep the *next*
             # day's optimizer input realistic — cheap to read back.
             soc = await _last_known_soc(writer, bucket, device_id, day, soc)
@@ -384,13 +394,21 @@ from(bucket:"{bucket}")
 async def _price_source(writer: InfluxWriter, bucket: str, device_id: str,
                          day: date) -> Optional[str]:
     """The `source` tag (`oree` or `fallback`) of the market_price entry
-    currently stored for `day`, or None if none exists yet."""
+    currently stored for `day`, or None if none exists yet.
+
+    `source` is a tag, so a real fetch lands as a second series beside the
+    fallback one rather than replacing it. "oree" wins whenever it exists —
+    the same rule the dashboard's revenue panels apply — otherwise a day
+    already upgraded would still read as fallback and be refetched on
+    every start."""
     flux = f'''
 from(bucket:"{bucket}")
   |> range(start: {day.isoformat()}T00:00:00Z, stop: {(day + timedelta(days=1)).isoformat()}T00:00:00Z)
   |> filter(fn: (r) => r._measurement == "market_price" and r._field == "price_uah_mwh" and r.device_id == "{device_id}")
-  |> limit(n: 1)
   |> keep(columns: ["source"])
+  |> group()
+  |> sort(columns: ["source"], desc: true)
+  |> limit(n: 1)
 '''
     rows = await writer.query(flux)
     return rows[0]["source"] if rows else None

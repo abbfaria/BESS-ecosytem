@@ -39,13 +39,37 @@ _PAGE_TIMEOUT_MS = 30_000
 # startup and teardown — the parts no per-operation timeout covers.
 _FETCH_TIMEOUT_S = 90
 
+# The page opens on the month of the latest published day, so the last
+# afternoon of a month already shows the *next* month, and any earlier day
+# lives in another month's table. The page's own AJAX endpoint serves any
+# month; it answers {"caption", "content": "<table id=price_table>..."} for
+# a published month and a full HTML page otherwise. Called from inside the
+# loaded page so it carries the session the endpoint insists on, once the
+# page's own initial request has settled — overlapping it intermittently
+# gets the HTML page back even for a published month, hence the retries.
+_LOAD_MONTH_JS = """async (month) => {
+    const r = await fetch('/index.php/pricectr/data_view', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                  'X-Requested-With': 'XMLHttpRequest'},
+        body: 'date=' + month + '&market=DAM&zone=IPS'});
+    const text = await r.text();
+    let data;
+    try { data = JSON.parse(text); } catch (e) { return 'HTTP ' + r.status + ': ' + text.slice(0, 80); }
+    if (!data.content || !data.content.includes('price_table')) return 'no price_table in reply';
+    document.querySelector('#price_table').outerHTML = data.content;
+    return 'ok';
+}"""
+_MONTH_ATTEMPTS = 3
+
+_NOT_FOUND = object()
+
 
 async def fetch_dam_prices(for_date: date) -> Optional[list[float]]:
     """Fetch 24 real hourly DAM prices [UAH/MWh] for `for_date` from
-    oree.com.ua. Returns None if the site is unreachable, the row for that
-    date isn't in the currently displayed month (a page for a different
-    month would need date-picker navigation, not implemented), or the row
-    can't be parsed — callers should treat that as "try the next source".
+    oree.com.ua. Returns None if the site is unreachable, the date isn't
+    published (yet), or the row can't be parsed — callers should treat that
+    as "try the next source".
 
     The whole browser session is bounded by `_FETCH_TIMEOUT_S`. The
     per-operation timeouts below cover goto/wait_for, but nothing covered
@@ -86,31 +110,56 @@ async def _fetch_dam_prices_inner(for_date: date) -> Optional[list[float]]:
                     "#price_table tbody tr", timeout=_PAGE_TIMEOUT_MS
                 )
 
-                rows = await page.locator("#price_table tbody tr").all()
-                for row in rows:
-                    cells = await row.locator("td").all_inner_texts()
-                    if not cells or cells[0].strip() != target:
-                        continue
-                    values = cells[1:25]
-                    if len(values) != 24:
-                        log.warning("oree.com.ua row has unexpected cell count",
-                                    date=target, cells=len(values))
-                        return None
+                result = await _read_row(page, target, for_date)
+                month = for_date.strftime("%m.%Y")
+                shown = await page.input_value("#price_date")
+                if result is _NOT_FOUND and month != shown:
                     try:
-                        local = [float(re.sub(r"[^\d.]", "", v)) for v in values]
-                    except ValueError:
-                        log.warning("oree.com.ua row has non-numeric cell",
-                                    date=target, raw=values)
-                        return None
-                    # The table's columns are Kyiv local delivery hours; every
-                    # consumer downstream indexes by UTC hour. See timebase.
-                    return local_hours_to_utc(local, for_date)
-
-                log.info("Date not found in current month view on oree.com.ua "
-                         "(month navigation not implemented)", date=target)
-                return None
+                        await page.wait_for_load_state("networkidle",
+                                                       timeout=_PAGE_TIMEOUT_MS)
+                    except Exception:
+                        pass   # best effort; the retries below still apply
+                    for attempt in range(1, _MONTH_ATTEMPTS + 1):
+                        status = await page.evaluate(_LOAD_MONTH_JS, month)
+                        if status == "ok":
+                            result = await _read_row(page, target, for_date)
+                            break
+                        if attempt == _MONTH_ATTEMPTS:
+                            log.info("oree.com.ua month table unavailable",
+                                     month=month, reply=status)
+                        else:
+                            await asyncio.sleep(2 * attempt)
+                if result is _NOT_FOUND:
+                    log.info("Date not found on oree.com.ua", date=target)
+                    return None
+                return result
             finally:
                 await browser.close()
     except Exception as exc:
         log.warning("oree.com.ua headless fetch failed", exc=str(exc))
         return None
+
+
+async def _read_row(page, target: str, for_date: date):
+    """Prices for `target` (dd.mm.YYYY) from the table currently in the page,
+    None if its row is malformed, or `_NOT_FOUND` if there is no such row."""
+    rows = await page.locator("#price_table tbody tr").all()
+    for row in rows:
+        cells = await row.locator("td").all_inner_texts()
+        if not cells or cells[0].strip() != target:
+            continue
+        values = cells[1:25]
+        if len(values) != 24:
+            log.warning("oree.com.ua row has unexpected cell count",
+                        date=target, cells=len(values))
+            return None
+        try:
+            local = [float(re.sub(r"[^\d.]", "", v)) for v in values]
+        except ValueError:
+            log.warning("oree.com.ua row has non-numeric cell",
+                        date=target, raw=values)
+            return None
+        # The table's columns are Kyiv local delivery hours; every
+        # consumer downstream indexes by UTC hour. See timebase.
+        return local_hours_to_utc(local, for_date)
+    return _NOT_FOUND

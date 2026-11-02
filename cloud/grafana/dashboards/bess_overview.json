@@ -382,7 +382,7 @@
         {
           "refId": "A",
           "datasource": "InfluxDB-BESS",
-          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nfrom(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"market_price\" and r._field == \"price_uah_mwh\") |> drop(columns: [\"device_id\", \"source\"]) |> set(key: \"_field\", value: \"Ціна РДН\")"
+          "query": "// One price per hour: \"oree\" sorts ahead of \"fallback\", so the real\n// market price wins where both exist (same rule as the revenue panels).\nstart = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nfrom(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"market_price\" and r._field == \"price_uah_mwh\") |> drop(columns: [\"device_id\"]) |> group(columns: [\"_time\"]) |> sort(columns: [\"source\"], desc: true) |> first() |> group() |> sort(columns: [\"_time\"]) |> drop(columns: [\"source\"]) |> set(key: \"_field\", value: \"Ціна РДН\")"
         }
       ]
     }
