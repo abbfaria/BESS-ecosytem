@@ -61,7 +61,7 @@
         {
           "refId": "A",
           "datasource": "InfluxDB-BESS",
-          "query": "from(bucket:\"telemetry\") |> range(start: -24h, stop: 24h) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"battery_soc_pct\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> group() |> sort(columns: [\"_time\"]) |> last()"
+          "query": "from(bucket:\"telemetry\") |> range(start: -24h, stop: 24h) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"battery_soc_pct\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> group() |> sort(columns: [\"_time\"]) |> last() |> keep(columns: [\"_time\", \"_value\"])"
         }
       ]
     },
@@ -382,7 +382,7 @@
         {
           "refId": "A",
           "datasource": "InfluxDB-BESS",
-          "query": "// One price per hour: \"oree\" sorts ahead of \"fallback\", so the real\n// market price wins where both exist (same rule as the revenue panels).\nstart = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nfrom(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"market_price\" and r._field == \"price_uah_mwh\") |> drop(columns: [\"device_id\"]) |> group(columns: [\"_time\"]) |> sort(columns: [\"source\"], desc: true) |> first() |> group() |> sort(columns: [\"_time\"]) |> drop(columns: [\"source\"]) |> set(key: \"_field\", value: \"Ціна РДН\")"
+          "query": "// One price per hour: \"oree\" sorts ahead of \"fallback\", so the real\n// market price wins where both exist (same rule as the revenue panels).\n// keep(): ungrouping turns _start/_stop into plain time columns, and\n// Grafana would take _start (one value for every row) as the time axis.\nstart = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nfrom(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"market_price\" and r._field == \"price_uah_mwh\") |> drop(columns: [\"device_id\"]) |> group(columns: [\"_time\"]) |> sort(columns: [\"source\"], desc: true) |> first() |> group() |> sort(columns: [\"_time\"]) |> drop(columns: [\"source\"]) |> set(key: \"_field\", value: \"Ціна РДН\") |> group(columns: [\"_field\"]) |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
         }
       ]
     }
