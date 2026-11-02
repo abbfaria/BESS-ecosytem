@@ -29,7 +29,7 @@ import os
 import signal
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -53,6 +53,12 @@ MQTT_HOST            = os.environ.get("MQTT_HOST", "cloud.bess.local")
 MQTT_PORT            = int(os.environ.get("MQTT_PORT", "8883"))
 ENTSOE_TOKEN         = os.environ.get("ENTSOE_TOKEN", "")
 DATA_DIR             = Path(os.environ.get("DATA_DIR", "/data"))
+
+# Minimum spacing between attempts to compute a missing schedule. The schedule
+# loop polls every 60 s (so that a wall-clock jump is noticed promptly), but a
+# price fetch plus a MILP solve is far too heavy to retry at that rate when it
+# is failing persistently.
+_SCHEDULE_RETRY_S = 300.0
 
 # MQTT topic helpers (inline to avoid circular import)
 def _topic(kind: str) -> str:
@@ -89,6 +95,11 @@ class EdgeOrchestrator:
         # Hour for which a "no price available" warning was already emitted,
         # so the sensor loop cannot log it once per 10 s tick.
         self._price_warn_hour: int = -1
+        # (date, monotonic timestamp) of the last attempt to compute a
+        # missing schedule, rate-limiting retries to _SCHEDULE_RETRY_S. Keyed
+        # by date so that rolling into a new day always retries at once
+        # instead of serving out the previous day's backoff.
+        self._last_schedule_attempt: Optional[tuple[str, float]] = None
 
     async def run(self) -> None:
         self._running = True
@@ -225,12 +236,24 @@ class EdgeOrchestrator:
         laptop — never obtained a schedule for that day at all and spent
         the whole day on the crude rule-based fallback, ignoring real
         prices entirely. Checking on every schedule tick closes that: the
-        node becomes self-sufficient and recovers within the hour no matter
-        when it wakes up, without depending on the cloud being reachable.
+        node becomes self-sufficient and recovers within about a minute of
+        waking up, whenever that happens to be, without depending on the
+        cloud being reachable.
         """
         today = datetime.now(timezone.utc).date()
         if self._fallback.has_schedule_for(today.isoformat()):
             return
+
+        # The loop below polls once a minute; computing a schedule involves a
+        # price fetch and a MILP solve, so a persistent failure (no cached
+        # prices, unreachable cloud) must not be retried at that cadence.
+        now_mono = time.monotonic()
+        if self._last_schedule_attempt is not None:
+            last_date, last_mono = self._last_schedule_attempt
+            if (last_date == today.isoformat()
+                    and now_mono - last_mono < _SCHEDULE_RETRY_S):
+                return
+        self._last_schedule_attempt = (today.isoformat(), now_mono)
 
         log.info("No schedule for today — computing one now", date=today.isoformat())
         try:
@@ -261,13 +284,26 @@ class EdgeOrchestrator:
             except Exception as exc:
                 log.error("Schedule loop error", exc=str(exc))
 
-            # Sleep until start of next hour
-            now      = datetime.now(timezone.utc)
-            next_h   = (now + timedelta(hours=1)).replace(
+            # Re-check every minute rather than sleeping straight through to
+            # the next hour boundary. asyncio.sleep() is backed by the
+            # monotonic clock, which does not advance while the host is
+            # suspended and is unaffected when the wall clock is afterwards
+            # re-stepped by NTP. One long sleep therefore survives a
+            # suspend/resume cycle fully intact: a laptop that resumes to find
+            # the wall clock 15 hours further on — a different day, a
+            # different price curve, a schedule that no longer applies — still
+            # waits out the remainder of the hour it fell asleep in before
+            # noticing any of that. Polling at a minute bounds the blind spot
+            # to ~60 s and costs nothing measurable: _ensure_today_schedule()
+            # returns on the first line once the current date is covered, and
+            # re-applying an unchanged hourly action to the emulator is
+            # idempotent.
+            now     = datetime.now(timezone.utc)
+            next_h  = (now + timedelta(hours=1)).replace(
                 minute=0, second=0, microsecond=0
             )
-            sleep_s  = (next_h - now).total_seconds()
-            await asyncio.sleep(max(60.0, sleep_s))
+            sleep_s = (next_h - now).total_seconds()
+            await asyncio.sleep(min(60.0, max(1.0, sleep_s)))
 
     # ── Market data loop ───────────────────────────────────────────────────────
 
@@ -313,7 +349,13 @@ class EdgeOrchestrator:
         latest = self._store.get_latest_telemetry(1)
         soc = latest[0].get("battery_soc_pct", 50.0) if latest else 50.0
 
-        actions = self._optimizer.optimize(prices, soc)
+        # The plant's own noise-free physics double as the forecast, so the
+        # schedule is optimised against the conditions it will actually meet
+        # (see BESSOptimizer.optimize on why the load has to be in the model).
+        gen_kw, load_kw = self._emulator.forecast_day(date.fromisoformat(valid_date))
+        actions = self._optimizer.optimize(prices, soc,
+                                           gen_forecast_kw=gen_kw,
+                                           load_forecast_kw=load_kw)
         self._fallback.save_schedule(actions, valid_date)
 
         schedule_payload = {

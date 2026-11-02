@@ -119,7 +119,10 @@ async def ensure_history(writer: InfluxWriter, bucket: str, device_id: str,
             continue
 
         prices, source = await _prices_for(writer, bucket, device_id, day)
-        schedule = optimizer.optimize(prices, soc)
+        gen_kw, load_kw = emulator.forecast_day(day)
+        schedule = optimizer.optimize(prices, soc,
+                                      gen_forecast_kw=gen_kw,
+                                      load_forecast_kw=load_kw)
         soc = await _replay_day(writer, emulator, device_id, day, schedule, hours=missing)
 
         await writer.write_market_price(device_id, day.isoformat(), prices, source)
@@ -276,7 +279,10 @@ async def _ensure_forward(writer: InfluxWriter, bucket: str, optimizer: "BESSOpt
         # — no separate "upgrade" code path needed to get fresh prices,
         # just not skipping the day.
         prices, source = await _prices_for(writer, bucket, device_id, d)
-        schedule = optimizer.optimize(prices, soc)
+        gen_kw, load_kw = emulator.forecast_day(d)
+        schedule = optimizer.optimize(prices, soc,
+                                      gen_forecast_kw=gen_kw,
+                                      load_forecast_kw=load_kw)
         upgraded_now = needs_upgrade and source == "oree"
         if upgraded_now:
             upgraded += 1
@@ -392,6 +398,17 @@ from(bucket:"{bucket}")
 
 async def _cached_market_prices(writer: InfluxWriter, bucket: str, device_id: str,
                                  day: date) -> Optional[list[float]]:
+    """Previously-stored real prices for `day`, or None to go and fetch them.
+
+    Returning None for a day whose points predate the UTC-hour convention
+    is what makes the timezone correction reach existing history. Those
+    points sit at the right timestamps but hold Kyiv-local-hour values, and
+    this function reads them back positionally — so without the check it
+    would hand a locally-indexed curve to an optimizer that assumes UTC and
+    then write it straight back, preserving the three-hour displacement
+    indefinitely. Refetching rewrites the same 24 timestamps in place, so
+    the repair needs no deletion.
+    """
     flux = f'''
 from(bucket:"{bucket}")
   |> range(start: {day.isoformat()}T00:00:00Z, stop: {(day + timedelta(days=1)).isoformat()}T00:00:00Z)
@@ -402,6 +419,20 @@ from(bucket:"{bucket}")
     rows = await writer.query(flux)
     if len(rows) != 24:
         return None
+
+    marker = f'''
+from(bucket:"{bucket}")
+  |> range(start: {day.isoformat()}T00:00:00Z, stop: {(day + timedelta(days=1)).isoformat()}T00:00:00Z)
+  |> filter(fn: (r) => r._measurement == "market_price" and r._field == "hour_basis_utc"
+            and r.device_id == "{device_id}" and r.source == "oree")
+  |> count()
+'''
+    marked = await writer.query(marker)
+    if not marked or int(marked[0]["_value"]) != 24:
+        log.info("Stored prices predate the UTC-hour convention — refetching",
+                  date=day.isoformat())
+        return None
+
     return [float(r["_value"]) for r in rows]
 
 

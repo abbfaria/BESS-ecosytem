@@ -33,6 +33,8 @@ from src.mqtt.buffer import MQTTBuffer
 from src.control.optimizer import BESSOptimizer, OptimizerConfig
 from src.control.fallback import FallbackController
 from src.control.economics import compute_revenue_uah
+from src.market_data.timebase import (kyiv_utc_offset_hours,
+                                      local_hours_to_utc, kyiv_local_hour)
 from src.db.sqlite_store import SQLiteStore
 
 
@@ -684,3 +686,137 @@ if __name__ == "__main__":
     print("BESS Ecosystem Integration Test Harness")
     print("=" * 60)
     unittest.main(verbosity=2)
+
+
+class TestMarketTimebase(unittest.TestCase):
+    """Kyiv-local DAM hours must land on the right UTC hours.
+
+    oree.com.ua publishes the 24 delivery periods in Kyiv local time while
+    everything downstream indexes by UTC hour. Treating the two as the same
+    thing displaced every price by Kyiv's UTC offset, so the optimizer saw
+    the evening peak three hours after it had actually passed.
+    """
+
+    def test_offset_follows_dst(self):
+        self.assertEqual(kyiv_utc_offset_hours(date(2026, 10, 11)), 3)   # EEST
+        self.assertEqual(kyiv_utc_offset_hours(date(2026, 11, 11)), 2)   # EET
+        self.assertEqual(kyiv_utc_offset_hours(date(2026, 1, 15)), 2)    # EET
+
+    def test_evening_peak_moves_to_its_real_utc_hour(self):
+        # A curve that is zero everywhere except the 19:00 local peak.
+        local = [0.0] * 24
+        local[19] = 11500.0
+        utc = local_hours_to_utc(local, date(2026, 10, 11))
+        self.assertEqual(utc[16], 11500.0)   # 19:00 EEST == 16:00 UTC
+        self.assertEqual(utc[19], 0.0)
+
+    def test_is_a_pure_rotation(self):
+        local = [float(h) for h in range(24)]
+        utc = local_hours_to_utc(local, date(2026, 10, 11))
+        self.assertEqual(sorted(utc), sorted(local))   # nothing invented or lost
+        self.assertEqual(utc[0], 3.0)
+        self.assertEqual(utc[21:], [0.0, 1.0, 2.0])    # documented day-edge wrap
+
+    def test_rejects_wrong_length(self):
+        with self.assertRaises(ValueError):
+            local_hours_to_utc([1.0, 2.0], date(2026, 10, 11))
+
+    def test_local_hour_is_dst_aware(self):
+        # The emulator's curves are written against local clock time, so a
+        # fixed +2 offset was an hour short for the whole EEST half-year.
+        summer = datetime(2026, 7, 1, 10, 0, tzinfo=timezone.utc)
+        winter = datetime(2026, 12, 1, 10, 0, tzinfo=timezone.utc)
+        self.assertAlmostEqual(kyiv_local_hour(summer), 13.0)
+        self.assertAlmostEqual(kyiv_local_hour(winter), 12.0)
+
+    def test_naive_input_is_read_as_utc(self):
+        naive = datetime(2026, 7, 1, 10, 0)
+        aware = datetime(2026, 7, 1, 10, 0, tzinfo=timezone.utc)
+        self.assertAlmostEqual(kyiv_local_hour(naive), kyiv_local_hour(aware))
+
+
+class TestForecastAlignment(unittest.TestCase):
+    """The plant's own physics, used as the optimizer's forecast."""
+
+    def setUp(self):
+        self.emu = BESSEmulator(EmulatorConfig())
+
+    def test_peaks_sit_on_the_right_utc_hours(self):
+        gen, load = self.emu.forecast_day(date(2026, 10, 12))
+        self.assertEqual(len(gen), 24)
+        self.assertEqual(len(load), 24)
+        # Solar noon is 13:00 local == 10:00 UTC under EEST; the household
+        # evening peak is modelled at 20:00 local == 17:00 UTC.
+        self.assertEqual(max(range(24), key=lambda h: gen[h]), 10)
+        self.assertEqual(max(range(24), key=lambda h: load[h]), 17)
+
+    def test_forecast_is_deterministic(self):
+        a, b = self.emu.forecast_day(date(2026, 10, 12))
+        c, d = self.emu.forecast_day(date(2026, 10, 12))
+        self.assertEqual(a, c)
+        self.assertEqual(b, d)
+
+    def test_measured_values_still_carry_noise(self):
+        at = datetime(2026, 10, 12, 10, 0, tzinfo=timezone.utc)
+        expected = self.emu._pv_power_expected(at)
+        draws = {round(self.emu._compute_pv_power(at), 6) for _ in range(20)}
+        self.assertGreater(len(draws), 1)              # noise survived refactor
+        self.assertGreater(expected, 0.0)
+
+
+class TestNetCashflowObjective(unittest.TestCase):
+    """Supplying forecasts changes what the plan's revenue figure *means*.
+
+    The arbitrage-only objective scored battery throughput, while the
+    dashboard scores the meter. Both numbers were called "revenue", so a
+    schedule reported as ~160 UAH could sit on a day measured at 87.
+    """
+
+    def setUp(self):
+        self.cfg = OptimizerConfig()
+        self.opt = BESSOptimizer(self.cfg)
+        self.emu = BESSEmulator(EmulatorConfig())
+        local = [7209, 5490, 4600, 4120, 4120, 4120, 5000, 5101,
+                 5200, 5200, 10, 10, 10, 10, 10, 10,
+                 2800, 7000, 8000, 11500, 10600, 9000, 5900, 5470]
+        self.prices = local_hours_to_utc([float(p) for p in local],
+                                         date(2026, 10, 11))
+
+    def test_provenance_distinguishes_the_two_objectives(self):
+        self.opt.optimize(self.prices, 50.0)
+        without = self.opt.last_method
+        gen, load = self.emu.forecast_day(date(2026, 10, 11))
+        self.opt.optimize(self.prices, 50.0,
+                          gen_forecast_kw=gen, load_forecast_kw=load)
+        withf = self.opt.last_method
+        # Whichever solver is actually available, the two runs must not be
+        # reported under the same label.
+        if without.startswith("milp"):
+            self.assertEqual(without, "milp-v1")
+            self.assertEqual(withf, "milp-netflow-v2")
+        else:
+            self.assertEqual(without, "greedy-v1")
+
+    def test_reported_revenue_matches_the_meter_definition(self):
+        gen, load = self.emu.forecast_day(date(2026, 10, 11))
+        actions = self.opt.optimize(self.prices, 50.0,
+                                    gen_forecast_kw=gen, load_forecast_kw=load)
+        if not self.opt.last_method.startswith("milp"):
+            self.skipTest("no MILP solver available in this environment")
+        # Recompute each hour the way Grafana does, straight off the plan.
+        for h, a in enumerate(actions):
+            chg = a.charge_pct / 100.0 * self.cfg.battery_charge_kw_max
+            dis = a.discharge_pct / 100.0 * self.cfg.battery_discharge_kw_max
+            grid_kw = load[h] + chg - dis - gen[h]
+            self.assertAlmostEqual(
+                a.expected_revenue,
+                round(-self.prices[h] / 1000.0 * grid_kw, 2),
+                places=1,
+                msg=f"hour {h} plan revenue is not the metered quantity",
+            )
+
+    def test_forecasts_must_be_supplied_in_pairs(self):
+        gen, _ = self.emu.forecast_day(date(2026, 10, 11))
+        # Only one half given → falls back to arbitrage-only, not a crash.
+        self.opt.optimize(self.prices, 50.0, gen_forecast_kw=gen)
+        self.assertIn(self.opt.last_method, ("milp-v1", "greedy-v1"))

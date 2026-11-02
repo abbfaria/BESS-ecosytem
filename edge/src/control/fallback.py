@@ -50,12 +50,20 @@ class FallbackController:
         self._path        = schedule_path
         self._schedules: dict[str, list[HourlyAction]] = {}
         self._loaded_date: Optional[str] = None   # most recently saved/loaded date (diagnostic)
+        # Last date for which the "no schedule" warning was emitted. The
+        # telemetry loop consults get_current_action() every few seconds, so
+        # logging unconditionally turned a single recoverable condition into
+        # hundreds of identical WARNING lines per hour, burying everything
+        # else in the log. Once per affected date is enough to diagnose it.
+        self._warned_missing_date: Optional[str] = None
 
     def save_schedule(self, actions: list[HourlyAction], valid_date: str) -> None:
         """Persist a schedule for `valid_date`, alongside (not instead of)
         any other currently-stored dates."""
         self._schedules[valid_date] = actions
         self._loaded_date = valid_date
+        if self._warned_missing_date == valid_date:
+            self._warned_missing_date = None
         self._prune()
         self._persist()
 
@@ -133,8 +141,10 @@ class FallbackController:
         if schedule and len(schedule) == 24:
             return schedule[hour]
 
-        if self._schedules:
-            log.warning("No stored schedule for today", today=today,
+        if self._schedules and self._warned_missing_date != today:
+            self._warned_missing_date = today
+            log.warning("No stored schedule for today — using rule-based fallback "
+                        "until one is computed", today=today,
                         stored_dates=sorted(self._schedules))
         return self._default_action(hour, soc_pct)
 

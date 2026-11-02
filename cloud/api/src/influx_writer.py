@@ -165,6 +165,14 @@ class InfluxWriter:
                 .tag("device_id", device_id)
                 .tag("source", source)
                 .field("price_uah_mwh", float(p))
+                # Marks this point as carrying a UTC-hour index. Points
+                # written before that convention was enforced lack the
+                # field entirely, which is what lets the read-back cache
+                # spot stale days and refetch them exactly once, instead
+                # of recycling a locally-indexed curve forever. A *field*
+                # rather than a tag on purpose: a varying tag would fork
+                # the series and break every aggregate over it.
+                .field("hour_basis_utc", 2)
                 .time(day.replace(hour=h, minute=0, second=0, microsecond=0), WritePrecision.NS)
                 for h, p in enumerate(prices)
             ]

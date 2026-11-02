@@ -17,10 +17,11 @@ import asyncio
 import math
 import random
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Optional
 
 from ..sensors.models import EmulatorConfig, SensorSnapshot
+from ..market_data.timebase import kyiv_local_hour
 from ..utils.logging_config import get_logger
 
 log = get_logger(__name__)
@@ -191,8 +192,20 @@ class BESSEmulator:
     # ── Physics models ───────────────────────────────────────────────────
 
     def _compute_pv_power(self, utc_now: datetime) -> float:
-        """Physics-based PV power model (UAH timezone ~ UTC+2/3)."""
-        hour = utc_now.hour + utc_now.minute / 60.0 + 2.0   # approximate local time
+        """Measured PV power: the physical model plus sensor/weather noise."""
+        power = self._pv_power_expected(utc_now)
+        if power <= 0.0:
+            return 0.0
+        return max(0.0, power + random.gauss(0, max(30, power * 0.02)))
+
+    def _pv_power_expected(self, utc_now: datetime) -> float:
+        """Noise-free PV output for a UTC instant.
+
+        Separated from the measured value so the optimizer can be handed a
+        forecast built from exactly the physics the plant will follow,
+        rather than a second, independently-drifting model of it.
+        """
+        hour = kyiv_local_hour(utc_now)
         if hour < 5.5 or hour > 20.5:
             return 0.0
 
@@ -207,27 +220,38 @@ class BESSEmulator:
         panel_temp   = max(25.0, 20.0 + 0.02 * clearsky_w / 100)
         temp_derating = max(0.8, 1.0 - 0.004 * (panel_temp - 25.0))
 
-        power = clearsky_w * attenuation * temp_derating * self.cfg.inverter_efficiency
-        noise = random.gauss(0, max(30, power * 0.02))
-        return max(0.0, power + noise)
+        return clearsky_w * attenuation * temp_derating * self.cfg.inverter_efficiency
 
     def _compute_wind_power(self) -> float:
-        """Wind turbine power (cubic law with cut-in/cut-out)."""
+        """Measured wind power: the turbine curve plus sensor noise."""
+        expected = self._wind_power_expected()
+        p_rated  = self.cfg.wind_peak_kw * 1000.0
+        return max(0.0, expected + random.gauss(0, p_rated * 0.03))
+
+    def _wind_power_expected(self) -> float:
+        """Noise-free turbine output (cubic law with cut-in/cut-out).
+
+        Kept separate from the measured value so forecast_day() stays a
+        pure function of state: drawing the noise term there made two
+        successive forecasts for the same day disagree, which is both
+        wrong as a forecast and a quiet source of schedule churn.
+        """
         ws = self._wind_speed_ms
         p_rated = self.cfg.wind_peak_kw * 1000.0
         v_cutin, v_rated, v_cutout = 3.0, 12.0, 25.0
         if ws < v_cutin or ws > v_cutout:
             return 0.0
-        if ws >= v_rated:
-            frac = 1.0
-        else:
-            frac = ((ws - v_cutin) / (v_rated - v_cutin)) ** 3
-        noise = random.gauss(0, p_rated * 0.03)
-        return max(0.0, p_rated * frac + noise)
+        frac = (1.0 if ws >= v_rated
+                else ((ws - v_cutin) / (v_rated - v_cutin)) ** 3)
+        return p_rated * frac
 
     def _compute_house_load(self, utc_now: datetime) -> float:
-        """Residential load profile for Ukrainian household."""
-        hour = utc_now.hour + utc_now.minute / 60.0 + 2.0   # local time approx
+        """Measured household load: the profile plus metering noise."""
+        return max(100.0, self._house_load_expected(utc_now) + random.gauss(0, 80.0))
+
+    def _house_load_expected(self, utc_now: datetime) -> float:
+        """Noise-free household load for a UTC instant (see _pv_power_expected)."""
+        hour = kyiv_local_hour(utc_now)
 
         base       = self.cfg.base_load_w
         # Morning peak 7–9 local
@@ -239,9 +263,29 @@ class BESSEmulator:
         # Night lull
         night_dip  = -200.0 * math.exp(-0.5 * ((hour - 3.0) / 2.0) ** 2)
 
-        total = base + morning + lunch + evening + night_dip
-        noise = random.gauss(0, 80.0)
-        return max(100.0, total + noise)
+        return max(100.0, base + morning + lunch + evening + night_dip)
+
+    def forecast_day(self, day: date) -> tuple[list[float], list[float]]:
+        """24-hour (UTC-indexed) generation and load forecast, in kW.
+
+        Generation includes the wind contribution at the currently observed
+        wind speed, held flat across the horizon: the turbine model has no
+        diurnal structure to project, so its present output is the best
+        available estimate and leaving it out entirely would understate
+        self-supply. Cloud cover is likewise carried forward from the
+        current observation, which is what a real site would do absent a
+        weather feed.
+
+        Indexed by UTC hour so it lines up with the price curve the
+        optimizer receives (see market_data.timebase).
+        """
+        wind_kw = self._wind_power_expected() / 1000.0
+        gen, load = [], []
+        for h in range(24):
+            at = datetime(day.year, day.month, day.day, h, tzinfo=timezone.utc)
+            gen.append(self._pv_power_expected(at) / 1000.0 + wind_kw)
+            load.append(self._house_load_expected(at) / 1000.0)
+        return gen, load
 
     def _compute_dispatch(self, pv_w: float, wind_w: float,
                           load_w: float, utc_now: datetime

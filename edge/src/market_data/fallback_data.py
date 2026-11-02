@@ -17,6 +17,8 @@ import random
 from datetime import date
 from typing import Optional
 
+from .timebase import local_hours_to_utc
+
 # Typical price profiles by hour (UAH/MWh, 24 values)
 _WEEKDAY_SUMMER = [
     1850, 1700, 1620, 1580, 1600, 1900,   # 00–05  night / early morning
@@ -93,7 +95,10 @@ def get_fallback_prices(for_date: Optional[date] = None) -> list[float]:
         noise = random.uniform(-0.12, 0.18)   # slight positive skew (spike risk)
         prices.append(round(max(500.0, base * (1 + noise)), 1))
 
-    return prices
+    # The profiles above are written in Kyiv local hours (their comments name
+    # local-time peaks), matching how the market publishes. Callers index by
+    # UTC hour, so convert here rather than leaving two conventions in play.
+    return local_hours_to_utc(prices, for_date)
 
 
 def get_fallback_prices_for_week(start_date: date) -> dict[str, list[float]]:

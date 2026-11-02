@@ -33,6 +33,7 @@ except ImportError:
     _AIOHTTP = False
 
 from .fallback_data import get_fallback_prices
+from .timebase import local_hours_to_utc
 from ..utils.logging_config import get_logger
 
 log = get_logger(__name__)
@@ -173,7 +174,9 @@ class DAMClient:
             cells = re.findall(r">([\d]+\.[\d]+)<", row_match.group(1))
             if len(cells) != 24:
                 return None
-            return [float(c) for c in cells]
+            # Columns are Kyiv local delivery hours — re-index to UTC, which
+            # is the convention everything downstream assumes. See timebase.
+            return local_hours_to_utc([float(c) for c in cells], for_date)
         except Exception as exc:
             log.debug("oree.com.ua parse error", exc=str(exc))
             return None

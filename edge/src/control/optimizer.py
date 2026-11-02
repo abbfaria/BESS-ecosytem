@@ -86,28 +86,47 @@ class BESSOptimizer:
         self,
         prices_uah_mwh: list[float],
         current_soc_pct: float,
+        gen_forecast_kw:  Optional[list[float]] = None,
+        load_forecast_kw: Optional[list[float]] = None,
     ) -> list[HourlyAction]:
         """Return 24 HourlyAction objects for the next day.
 
-        Note on scope: this is a pure *grid-arbitrage* model. PV output and
-        house load are deliberately not arguments — the emulator/plant
-        handles self-consumption physically, and the schedule only decides
-        when to buy from and sell to the grid. Earlier revisions accepted
-        `pv_forecast_kw`/`load_forecast_kw` and silently ignored them, which
-        implied a co-optimisation that was never implemented. Adding one is
-        a genuine modelling change (it alters what the revenue figures mean)
-        and is listed as further work rather than smuggled in here.
+        Supplying both forecasts (24 UTC-indexed hourly values, in kW)
+        switches the objective from pure battery arbitrage to the site's
+        **net grid cash flow** — the same quantity the dashboard measures as
+        revenue, and the one the operator actually banks.
+
+        That distinction turned out to matter, not just to be tidier. With
+        the house load outside the model, the optimizer could not see that
+        an empty pack forces the dwelling onto the grid: it would happily
+        sell the battery down to soc_min during the evening peak and leave
+        the late-evening hours — still priced at 5 000–9 000 UAH/MWh — to be
+        bought back at retail volumes. Measured over 2026-10-11 those hours
+        ran at a loss of roughly 17 UAH against a 87 UAH day, while the
+        schedule that produced them was reported as a ~160 UAH success,
+        because planner and dashboard were scoring different things.
+
+        Both forecasts are expected to be noise-free expectations of the
+        plant's own physics (BESSEmulator.forecast_day), not a separate
+        model of it. Omitting them preserves the original arbitrage-only
+        objective, which the greedy fallback below still uses.
         """
         assert len(prices_uah_mwh) == 24
+        co_opt = gen_forecast_kw is not None and load_forecast_kw is not None
+        if co_opt:
+            assert len(gen_forecast_kw) == 24 and len(load_forecast_kw) == 24
 
         if _PULP_OK:
             try:
-                actions = self._milp_optimize(prices_uah_mwh, current_soc_pct)
-                # _milp_optimize may itself fall back internally (infeasible);
-                # it sets last_method in that case, so only claim MILP here
-                # if it wasn't overridden.
-                if self.last_method != "greedy-v1":
-                    self.last_method = "milp-v1"
+                actions = self._milp_optimize(
+                    prices_uah_mwh, current_soc_pct,
+                    gen_forecast_kw if co_opt else None,
+                    load_forecast_kw if co_opt else None,
+                )
+                # _milp_optimize sets last_method itself — either to the
+                # variant it solved ("milp-v1" / "milp-netflow-v2") or to
+                # "greedy-v1" when it fell back internally on an infeasible
+                # model. Re-stamping it here would erase that distinction.
                 return actions
             except Exception as exc:
                 log.warning("MILP failed, falling back to greedy", exc=str(exc))
@@ -121,6 +140,8 @@ class BESSOptimizer:
         self,
         prices: list[float],
         soc0: float,
+        gen:  Optional[list[float]] = None,
+        load: Optional[list[float]] = None,
     ) -> list[HourlyAction]:
         cfg = self._cfg
         cap  = cfg.battery_capacity_kwh
@@ -144,11 +165,27 @@ class BESSOptimizer:
         soc   = [pulp.LpVariable(f"soc_{h}", soc_lo, soc_hi) for h in range(24)]
         b_chg = [pulp.LpVariable(f"bc_{h}", cat="Binary") for h in range(24)]
 
-        # Revenue = sell revenue − buy cost (all in UAH/h)
-        revenue = pulp.lpSum(
-            prices[h] / 1000.0 * (p_dis[h] * eta_d - p_chg[h] * inv_eta_c)
-            for h in range(24)
-        )
+        co_opt = gen is not None and load is not None
+        if co_opt:
+            # Net grid cash flow. grid[h] is the site's exchange with the
+            # network, free in sign: positive imports, negative exports.
+            # Earning is therefore the negative of what crosses the meter,
+            # priced hour by hour — identical to the dashboard's
+            # -(grid_kW) x (price/1000), so the plan is denominated in the
+            # same units it will later be judged in.
+            grid = [pulp.LpVariable(f"grid_{h}") for h in range(24)]
+            for h in range(24):
+                prob += grid[h] == load[h] + p_chg[h] - p_dis[h] - gen[h]
+            revenue = pulp.lpSum(
+                -prices[h] / 1000.0 * grid[h] for h in range(24)
+            )
+        else:
+            # Battery-only arbitrage: sell revenue - buy cost (UAH/h).
+            grid = None
+            revenue = pulp.lpSum(
+                prices[h] / 1000.0 * (p_dis[h] * eta_d - p_chg[h] * inv_eta_c)
+                for h in range(24)
+            )
         prob += revenue
 
         # SoC dynamics (initial SoC)
@@ -188,7 +225,10 @@ class BESSOptimizer:
         for h in range(24):
             chg = pulp.value(p_chg[h]) or 0.0
             dis = pulp.value(p_dis[h]) or 0.0
-            rev = prices[h] / 1000.0 * (dis * eta_d - chg / eta_c)
+            if co_opt:
+                rev = -prices[h] / 1000.0 * (pulp.value(grid[h]) or 0.0)
+            else:
+                rev = prices[h] / 1000.0 * (dis * eta_d - chg / eta_c)
 
             if dis > 0.1:
                 mode = "DISCHARGE_SELL"
@@ -210,8 +250,11 @@ class BESSOptimizer:
                 expected_revenue=round(rev, 2),
             ))
 
+        self.last_method = "milp-netflow-v2" if co_opt else "milp-v1"
+
         total_rev = sum(a.expected_revenue for a in actions)
         log.info("MILP schedule computed",
+                 objective="net-grid-cashflow" if co_opt else "battery-arbitrage",
                  total_revenue_uah=round(total_rev, 2),
                  discharge_hours=sum(1 for a in actions if a.mode == "DISCHARGE_SELL"),
                  charge_hours=sum(1 for a in actions if a.mode == "GRID_CHARGE"))

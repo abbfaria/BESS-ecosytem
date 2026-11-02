@@ -23,6 +23,7 @@ from datetime import date
 from typing import Optional
 
 from .logging_config import get_logger
+from edge_src.market_data.timebase import local_hours_to_utc
 
 log = get_logger(__name__)
 
@@ -96,11 +97,14 @@ async def _fetch_dam_prices_inner(for_date: date) -> Optional[list[float]]:
                                     date=target, cells=len(values))
                         return None
                     try:
-                        return [float(re.sub(r"[^\d.]", "", v)) for v in values]
+                        local = [float(re.sub(r"[^\d.]", "", v)) for v in values]
                     except ValueError:
                         log.warning("oree.com.ua row has non-numeric cell",
                                     date=target, raw=values)
                         return None
+                    # The table's columns are Kyiv local delivery hours; every
+                    # consumer downstream indexes by UTC hour. See timebase.
+                    return local_hours_to_utc(local, for_date)
 
                 log.info("Date not found in current month view on oree.com.ua "
                          "(month navigation not implemented)", date=target)
