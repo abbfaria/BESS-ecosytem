@@ -642,6 +642,45 @@ class TestEnergyConservation(unittest.TestCase):
                     msg=f"energy balance violated in {mode} at SoC {soc}%")
 
 
+class TestSoCLimitsAndRestore(unittest.IsolatedAsyncioTestCase):
+    """Long backfill ticks must not overshoot the SoC window, and a restart
+    must continue from the last recorded state."""
+
+    async def _run(self, mode, soc, **kw):
+        em = BESSEmulator(EmulatorConfig())
+        em._soc_pct = soc
+        em.force_mode(mode, **kw)
+        socs = []
+        t0 = datetime(2026, 11, 3, 0, 0, tzinfo=timezone.utc)
+        for i in range(24):
+            snap = await em.tick(as_of=t0 + timedelta(minutes=5 * i), dt_s=300.0)
+            socs.append(snap.battery_soc_pct)
+        return socs
+
+    async def test_discharge_stops_at_soc_min(self):
+        socs = await self._run("DISCHARGE_SELL", 11.0, discharge_pct=100.0)
+        self.assertGreaterEqual(min(socs), 9.99)
+
+    async def test_charge_stops_at_soc_max(self):
+        socs = await self._run("GRID_CHARGE", 94.0, charge_pct=100.0)
+        self.assertLessEqual(max(socs), 95.0)
+
+    async def test_restore_continues_from_snapshot(self):
+        em = BESSEmulator(EmulatorConfig())
+        snap = (await em.tick()).to_dict()
+        snap.update(battery_soc_pct=73.4, total_pv_energy_kwh=12.5, sequence_num=900)
+        em2 = BESSEmulator(EmulatorConfig())
+        em2.restore(snap)
+        self.assertAlmostEqual(em2._soc_pct, 73.4)
+        self.assertAlmostEqual(em2._total_pv_energy_kwh, 12.5)
+        self.assertEqual((await em2.tick()).sequence_num, 901)
+
+    def test_restore_ignores_garbage(self):
+        em = BESSEmulator(EmulatorConfig())
+        em.restore({"battery_soc_pct": None})
+        self.assertAlmostEqual(em._soc_pct, 50.0)
+
+
 class TestFallbackDepletion(unittest.TestCase):
     """The rule-based fallback must not pin the pack at its floor."""
 
@@ -879,10 +918,21 @@ class TestForecastAlignment(unittest.TestCase):
         gen, load = self.emu.forecast_day(date(2026, 10, 12))
         self.assertEqual(len(gen), 24)
         self.assertEqual(len(load), 24)
-        # Solar noon is 13:00 local == 10:00 UTC under EEST; the household
-        # evening peak is modelled at 20:00 local == 17:00 UTC.
-        self.assertEqual(max(range(24), key=lambda h: gen[h]), 10)
+        # Solar noon at Kyiv's longitude (30.5 E) is ~09:45 UTC, so the
+        # 09:00-10:00 UTC slot carries the most PV; the household evening
+        # peak is modelled at 20:00 local == 17:00 UTC.
+        self.assertEqual(max(range(24), key=lambda h: gen[h]), 9)
         self.assertEqual(max(range(24), key=lambda h: load[h]), 17)
+
+    def test_pv_follows_the_season(self):
+        # A fixed June curve all year planned ~9 kW of November export.
+        wind = self.emu._wind_power_expected() / 1000.0
+        june = sum(g - wind for g in self.emu.forecast_day(date(2026, 6, 21))[0])
+        nov = sum(g - wind for g in self.emu.forecast_day(date(2026, 11, 3))[0])
+        dec, _ = self.emu.forecast_day(date(2026, 12, 21))
+        self.assertLess(nov, 0.6 * june)
+        self.assertLess(max(dec) - wind, 0.6 * self.emu.cfg.pv_peak_kw)
+        self.assertEqual(dec[4] - wind, 0.0)          # 06:00 local: still dark
 
     def test_forecast_is_deterministic(self):
         a, b = self.emu.forecast_day(date(2026, 10, 12))

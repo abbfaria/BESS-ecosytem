@@ -7,7 +7,7 @@ Uses the official influxdb-client-python async API.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 try:
@@ -160,6 +160,59 @@ class InfluxWriter:
                 await self._write.write(bucket=self._bucket, org=self._org, record=points)
         except Exception as exc:
             log.error("InfluxDB write_schedule error", exc=str(exc))
+
+    async def purge_legacy_schedule_points(self) -> int:
+        """Delete `schedule` points still carrying `mode` as a *tag*.
+
+        Making `mode` a field (see write_schedule) fixed new writes but left
+        the points written before that in place — including the forward
+        projection, which reaches months ahead. Every rewrite of such a day
+        (the near-term upgrade to real prices, the edge's own publish) then
+        lands in a second, tagless series beside the old one, and any sum
+        over expected_revenue_uah counts the hour twice or more: the
+        "Очікуваний дохід завтра" figure came out several times too high.
+        A delete predicate can't say "tag exists", so the stale values are
+        looked up first and deleted one by one. Returns how many tag values
+        were purged.
+        """
+        if not self._ok:
+            return 0
+        rows = await self.query(f'''
+from(bucket:"{self._bucket}")
+  |> range(start: 1970-01-01T00:00:00Z, stop: 2100-01-01T00:00:00Z)
+  |> filter(fn: (r) => r._measurement == "schedule" and exists r.mode)
+  |> keep(columns: ["mode"])
+  |> group()
+  |> distinct(column: "mode")
+''')
+        modes = sorted({str(r["_value"]) for r in rows if r.get("_value")})
+        try:
+            delete_api = self._client.delete_api()
+            for mode in modes:
+                await delete_api.delete(
+                    start=datetime(1970, 1, 1, tzinfo=timezone.utc),
+                    stop=datetime(2100, 1, 1, tzinfo=timezone.utc),
+                    predicate=f'_measurement="schedule" AND mode="{mode}"',
+                    bucket=self._bucket, org=self._org)
+        except Exception as exc:
+            log.error("InfluxDB legacy schedule purge error", exc=str(exc))
+            return 0
+        if modes:
+            log.info("Purged legacy mode-tagged schedule points", modes=modes)
+        return len(modes)
+
+    async def delete_range(self, measurement: str, device_id: str,
+                           start: datetime, stop: datetime) -> None:
+        """Delete one device's points of `measurement` in [start, stop)."""
+        if not self._ok:
+            return
+        try:
+            await self._client.delete_api().delete(
+                start=start, stop=stop - timedelta(microseconds=1),
+                predicate=f'_measurement="{measurement}" AND device_id="{device_id}"',
+                bucket=self._bucket, org=self._org)
+        except Exception as exc:
+            log.error("InfluxDB delete error", measurement=measurement, exc=str(exc))
 
     async def write_market_price(self, device_id: str, valid_date: str,
                                   prices: list[float], source: str) -> None:

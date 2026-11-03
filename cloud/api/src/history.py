@@ -90,7 +90,14 @@ async def ensure_history(writer: InfluxWriter, bucket: str, device_id: str,
         log.warning("Skipping history backfill — InfluxDB not connected")
         return
 
+    # Before anything reads `schedule`: the stale mode-tagged series make
+    # _stored_edge_schedule see >24 rows and double every revenue sum.
+    await writer.purge_legacy_schedule_points()
+
     today = today or datetime.now(timezone.utc).date()
+    await _purge_synthetic_overlaps(writer, bucket, device_id,
+                                    today - timedelta(days=BACKFILL_DAYS),
+                                    today + timedelta(days=1))
     optimizer = BESSOptimizer(OptimizerConfig())
     emulator  = BESSEmulator(EmulatorConfig(device_id=device_id))
     soc       = emulator.cfg.initial_soc_pct
@@ -133,7 +140,8 @@ async def ensure_history(writer: InfluxWriter, bucket: str, device_id: str,
         schedule = optimizer.optimize(prices, soc,
                                       gen_forecast_kw=gen_kw,
                                       load_forecast_kw=load_kw)
-        soc = await _replay_day(writer, emulator, device_id, day, schedule, hours=missing)
+        soc = await _replay_day(writer, emulator, device_id, day, schedule, hours=missing,
+                                anchor_bucket=bucket)
 
         await writer.write_market_price(device_id, day.isoformat(), prices, source)
         # Only record this replay plan when the day has none: a partially
@@ -174,7 +182,8 @@ def _schedule_payload(day: date, schedule: list, price_source: str) -> dict:
 
 async def _replay_day(writer: InfluxWriter, emulator: "BESSEmulator", device_id: str,
                        day: date, schedule: list, forecast: bool = False,
-                       hours: Optional[set[int]] = None) -> float:
+                       hours: Optional[set[int]] = None,
+                       anchor_bucket: Optional[str] = None) -> float:
     """Step the real BESSEmulator through one day, writing telemetry as it
     goes. `forecast=False` (past days): TICK_MINUTES resolution, written to
     `telemetry` — this is the backfill's "as if the device had really been
@@ -199,11 +208,29 @@ async def _replay_day(writer: InfluxWriter, emulator: "BESSEmulator", device_id:
     write = writer.write_telemetry_forecast if forecast else writer.write_telemetry
     last_soc = emulator.cfg.initial_soc_pct
 
+    if forecast:
+        # A rebuilt forecast must replace the old one, not sit beside it:
+        # grid_status/inverter_mode are tags, so the same instant planned
+        # in a different mode is a separate series and the panels averaged
+        # the stale projection into the new one.
+        first_hour = min(hours) if hours else 0
+        await writer.delete_range("telemetry_forecast", device_id,
+                                  day_start + timedelta(hours=first_hour),
+                                  day_start + timedelta(days=1))
+
     for minute_of_day in range(0, 24 * 60, step_minutes):
         hour = minute_of_day // 60
         if hours is not None and hour not in hours:
             continue
         ts = day_start + timedelta(minutes=minute_of_day)
+        # A gap filled between real hours starts from the SoC actually
+        # recorded before it, so the line joins its neighbours instead of
+        # jumping to wherever the replay chain happened to be.
+        if (anchor_bucket and hours is not None and minute_of_day % 60 == 0
+                and hour - 1 not in hours):
+            anchor = await _soc_before(writer, anchor_bucket, device_id, ts)
+            if anchor is not None:
+                emulator.set_soc(anchor)
         action = schedule[hour]
 
         emulator.force_mode(action.mode, action.charge_pct, action.discharge_pct)
@@ -340,6 +367,96 @@ async def _ensure_forward(writer: InfluxWriter, bucket: str, optimizer: "BESSOpt
 
 # ── InfluxDB gap-detection helpers ──────────────────────────────────────────
 
+# Backfilled points sit exactly on a TICK_MINUTES boundary with zero
+# sub-seconds; live telemetry carries the edge's microsecond timestamps.
+_SYNTHETIC_TS = (f'date.second(t: r._time) == 0 and date.nanosecond(t: r._time) == 0 '
+                 f'and date.minute(t: r._time) % {TICK_MINUTES} == 0')
+
+
+async def _purge_synthetic_overlaps(writer: InfluxWriter, bucket: str, device_id: str,
+                                    start: date, stop: date) -> None:
+    """Remove backfilled points from hours that also hold real telemetry.
+
+    An hour is backfilled only while it has no telemetry at all, but the
+    edge buffers telemetry while it is offline and replays it on reconnect,
+    so the real points for that hour can arrive afterwards. Both then sit
+    in `telemetry` and every panel averages two unrelated trajectories
+    (seen: real SoC 77 % against backfilled 37 % in the same hour). Real
+    data wins; the synthetic points of such an hour are deleted.
+    """
+    flux = f'''
+import "date"
+from(bucket:"{bucket}")
+  |> range(start: {start.isoformat()}T00:00:00Z, stop: {stop.isoformat()}T00:00:00Z)
+  |> filter(fn: (r) => r._measurement == "telemetry" and r._field == "battery_soc_pct" and r.device_id == "{device_id}")
+  |> drop(columns: ["grid_status", "inverter_mode", "device_id"])
+  |> group()
+  |> map(fn: (r) => ({{_time: r._time, h: date.truncate(t: r._time, unit: 1h),
+                       syn: if {_SYNTHETIC_TS} then 1 else 0}}))
+  |> group(columns: ["h"])
+  |> reduce(identity: {{s: 0, n: 0}}, fn: (r, accumulator) => ({{s: accumulator.s + r.syn, n: accumulator.n + 1}}))
+  |> filter(fn: (r) => r.s > 0 and r.n > r.s)
+  |> group()
+  |> keep(columns: ["h"])
+'''
+    # Hours whose backfilled timestamps carry more than one point. Before
+    # _missing_hours labelled windows by their start, an empty hour made the
+    # hour after it look missing, and every pass replayed that hour again;
+    # grid_status/inverter_mode are tags, so each replay landed as another
+    # parallel series (up to four SoC values at one instant). All synthetic
+    # points of such an hour go; if nothing real is left it is simply
+    # refilled once by the backfill that follows.
+    stacked_flux = f'''
+import "date"
+from(bucket:"{bucket}")
+  |> range(start: {start.isoformat()}T00:00:00Z, stop: {stop.isoformat()}T00:00:00Z)
+  |> filter(fn: (r) => r._measurement == "telemetry" and r._field == "battery_soc_pct" and r.device_id == "{device_id}")
+  |> drop(columns: ["grid_status", "inverter_mode", "device_id"])
+  |> group()
+  |> filter(fn: (r) => {_SYNTHETIC_TS})
+  |> group(columns: ["_time"])
+  |> count()
+  |> filter(fn: (r) => r._value > 1)
+  |> group()
+  |> map(fn: (r) => ({{h: date.truncate(t: r._time, unit: 1h)}}))
+  |> unique(column: "h")
+'''
+    hours = sorted({r["h"] for r in await writer.query(flux)}
+                   | {r["h"] for r in await writer.query(stacked_flux)})
+    for h in hours:
+        h_end = h + timedelta(hours=1)
+        ts_flux = f'''
+import "date"
+from(bucket:"{bucket}")
+  |> range(start: {h.strftime("%Y-%m-%dT%H:%M:%SZ")}, stop: {h_end.strftime("%Y-%m-%dT%H:%M:%SZ")})
+  |> filter(fn: (r) => r._measurement == "telemetry" and r._field == "battery_soc_pct" and r.device_id == "{device_id}")
+  |> filter(fn: (r) => {_SYNTHETIC_TS})
+  |> keep(columns: ["_time"])
+  |> group()
+'''
+        times = sorted({r["_time"] for r in await writer.query(ts_flux)})
+        for t in times:
+            await writer.delete_range("telemetry", device_id, t, t + timedelta(microseconds=2))
+    if hours:
+        log.info("Removed overlapping or duplicated backfilled points",
+                 hours=len(hours))
+
+
+async def _soc_before(writer: InfluxWriter, bucket: str, device_id: str,
+                      ts: datetime) -> Optional[float]:
+    """Last recorded SoC in the 6 h before `ts`, or None."""
+    flux = f'''
+from(bucket:"{bucket}")
+  |> range(start: {(ts - timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%SZ")}, stop: {ts.strftime("%Y-%m-%dT%H:%M:%SZ")})
+  |> filter(fn: (r) => r._measurement == "telemetry" and r._field == "battery_soc_pct" and r.device_id == "{device_id}")
+  |> drop(columns: ["grid_status", "inverter_mode", "device_id"])
+  |> group()
+  |> sort(columns: ["_time"])
+  |> last()
+'''
+    rows = await writer.query(flux)
+    return float(rows[0]["_value"]) if rows else None
+
 async def _missing_hours(writer: InfluxWriter, bucket: str, device_id: str,
                           day: date) -> set[int]:
     """Which of the day's 24 hours have *no* telemetry at all.
@@ -364,13 +481,16 @@ async def _missing_hours(writer: InfluxWriter, bucket: str, device_id: str,
     # combination and returns multiple rows per hour instead of one true
     # per-hour total — the exact tag-splitting failure mode already
     # documented for the Grafana panels themselves.
+    # timeSrc "_start" labels each window by the hour it covers. With the
+    # default (_stop) an empty hour h was reported as h+1: the backfill
+    # wrote into the next hour, on top of its real data, and h stayed empty.
     flux = f'''
 import "date"
 from(bucket:"{bucket}")
   |> range(start: {day.isoformat()}T00:00:00Z, stop: {(day + timedelta(days=1)).isoformat()}T00:00:00Z)
   |> filter(fn: (r) => r._measurement == "telemetry" and r._field == "revenue_uah" and r.device_id == "{device_id}")
   |> drop(columns: ["grid_status", "inverter_mode", "device_id"])
-  |> aggregateWindow(every: 1h, fn: count, createEmpty: true)
+  |> aggregateWindow(every: 1h, fn: count, createEmpty: true, timeSrc: "_start")
   |> map(fn: (r) => ({{hour: date.hour(t: r._time), covered: r._value}}))
   |> keep(columns: ["hour", "covered"])
 '''
@@ -515,6 +635,8 @@ async def _last_known_soc(writer: InfluxWriter, bucket: str, device_id: str,
 from(bucket:"{bucket}")
   |> range(start: {day.isoformat()}T00:00:00Z, stop: {(day + timedelta(days=1)).isoformat()}T00:00:00Z)
   |> filter(fn: (r) => r._measurement == "telemetry" and r._field == "battery_soc_pct" and r.device_id == "{device_id}")
+  |> drop(columns: ["grid_status", "inverter_mode", "device_id"])
+  |> group()
   |> sort(columns: ["_time"], desc: true)
   |> limit(n: 1)
 '''
@@ -535,6 +657,7 @@ from(bucket:"{bucket}")
   |> filter(fn: (r) => r._measurement == "telemetry" and r._field == "battery_soc_pct" and r.device_id == "{device_id}")
   |> drop(columns: ["grid_status", "inverter_mode", "device_id"])
   |> group()
+  |> sort(columns: ["_time"])
   |> last()
 '''
     rows = await writer.query(flux)
@@ -549,6 +672,8 @@ async def _last_known_soc_forecast(writer: InfluxWriter, bucket: str, device_id:
 from(bucket:"{bucket}")
   |> range(start: {day.isoformat()}T00:00:00Z, stop: {(day + timedelta(days=1)).isoformat()}T00:00:00Z)
   |> filter(fn: (r) => r._measurement == "telemetry_forecast" and r._field == "battery_soc_pct" and r.device_id == "{device_id}")
+  |> drop(columns: ["grid_status", "inverter_mode", "device_id"])
+  |> group()
   |> sort(columns: ["_time"], desc: true)
   |> limit(n: 1)
 '''

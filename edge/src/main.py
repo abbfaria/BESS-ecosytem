@@ -117,6 +117,14 @@ class EdgeOrchestrator:
         self._store.open()
         self._buffer.open()
 
+        # Continue the battery from where it was, not from initial_soc_pct.
+        try:
+            latest = self._store.get_latest_telemetry(1)
+            if latest:
+                self._emulator.restore(latest[0])
+        except Exception as exc:
+            log.warning("Could not restore emulator state", exc=str(exc))
+
         # Load any persisted schedule
         self._fallback.load_schedule()
 

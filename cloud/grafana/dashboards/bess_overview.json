@@ -46,12 +46,12 @@
                 "value": 0
               },
               {
-                "color": "yellow",
-                "value": 20
+                "color": "orange",
+                "value": 12
               },
               {
                 "color": "green",
-                "value": 40
+                "value": 25
               }
             ]
           }
@@ -301,7 +301,7 @@
         {
           "refId": "A",
           "datasource": "InfluxDB-BESS",
-          "query": "import \"date\"\nt0 = date.add(d: 1d, to: date.truncate(t: now(), unit: 1d))\nt1 = date.add(d: 2d, to: date.truncate(t: now(), unit: 1d))\nfrom(bucket:\"telemetry\") |> range(start: t0, stop: t1) |> filter(fn:(r) => r._measurement == \"schedule\" and r._field == \"expected_revenue_uah\") |> drop(columns: [\"mode\", \"device_id\"]) |> sum()"
+          "query": "import \"date\"\nt0 = date.add(d: 1d, to: date.truncate(t: now(), unit: 1d))\nt1 = date.add(d: 2d, to: date.truncate(t: now(), unit: 1d))\n// One value per hour. Points written while `mode` was still a tag form a\n// separate series per mode; a later rewrite of the same hour (real-price\n// upgrade, the edge's own plan) then sat beside them and sum() counted the\n// hour two or three times. Tagless (current) points win over legacy ones.\nfrom(bucket:\"telemetry\")\n  |> range(start: t0, stop: t1)\n  |> filter(fn:(r) => r._measurement == \"schedule\" and r._field == \"expected_revenue_uah\")\n  |> map(fn:(r) => ({_time: r._time, _value: r._value, legacy: if exists r.mode then 1 else 0}))\n  |> group(columns: [\"_time\"])\n  |> sort(columns: [\"legacy\"])\n  |> first()\n  |> group()\n  |> sum()"
         }
       ]
     },

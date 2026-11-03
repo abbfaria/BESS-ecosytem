@@ -15,6 +15,11 @@ class EmulatorConfig:
     # PV array
     pv_peak_kw:              float = 10.0     # kW installed capacity
     inverter_efficiency:     float = 0.97
+    # Site and array geometry (Kyiv, south-facing fixed tilt): sets day
+    # length and sun height, i.e. the season.
+    site_lat_deg:            float = 50.45
+    site_lon_deg:            float = 30.52
+    pv_tilt_deg:             float = 35.0
 
     # Wind turbine (optional, 0 to disable)
     wind_peak_kw:            float = 2.0

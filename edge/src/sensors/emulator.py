@@ -72,6 +72,8 @@ class BESSEmulator:
         self._cloud_cover    = 0.3     # 0=clear, 1=overcast
         self._cloud_tau_s    = 3600.0  # cloud-cover correlation time
         self._cloud_sd       = 0.2     # stationary std. dev. of cloud cover
+        self._cloud_mu       = 0.3     # long-run mean cloud cover
+        self._weather_ts: Optional[datetime] = None   # sim time of the cover above
         self._wind_speed_ms  = 5.0     # m/s
         # Wind speed is an Ornstein-Uhlenbeck process, parameterised by its
         # correlation time and stationary spread rather than raw theta/sigma.
@@ -110,6 +112,28 @@ class BESSEmulator:
         """Place the pack at a given state of charge (forecast anchoring)."""
         self._soc_pct = max(0.0, min(100.0, float(soc_pct)))
 
+    def restore(self, snapshot: dict) -> None:
+        """Resume from the last recorded snapshot after a process restart.
+
+        Without this every container restart (deploy, watchdog, VM reboot)
+        put the pack back at initial_soc_pct and zeroed the energy meters,
+        so the SoC line jumped to 50 % and the counters went backwards.
+        """
+        def num(key: str, default: float) -> float:
+            try:
+                return float(snapshot.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        self.set_soc(num("battery_soc_pct", self._soc_pct))
+        self._batt_temp_c   = num("battery_temp_c", self._batt_temp_c)
+        self._inverter_temp = num("inverter_temp_c", self._inverter_temp)
+        self._total_pv_energy_kwh   = num("total_pv_energy_kwh", 0.0)
+        self._total_grid_import_kwh = num("total_grid_import_kwh", 0.0)
+        self._total_grid_export_kwh = num("total_grid_export_kwh", 0.0)
+        self._sequence_num = int(num("sequence_num", 0))
+        log.info("Emulator state restored", soc=round(self._soc_pct, 2))
+
     def force_mode(self, mode: str, charge_pct: float = 0.0,
                     discharge_pct: float = 0.0) -> None:
         """Set dispatch mode directly, without the time.monotonic()-based
@@ -145,13 +169,14 @@ class BESSEmulator:
 
         # 1. Evolve environment
         self._evolve_weather(dt_s)
+        self._weather_ts = utc_now
         self._evolve_grid(dt_s)
 
         # 2. Compute power flows
         pv_w    = self._compute_pv_power(utc_now)
         wind_w  = self._compute_wind_power()
         load_w  = self._compute_house_load(utc_now)
-        batt_w, grid_w = self._compute_dispatch(pv_w, wind_w, load_w, utc_now)
+        batt_w, grid_w = self._compute_dispatch(pv_w, wind_w, load_w, utc_now, dt_s)
 
         # 3. Update battery SoC
         self._update_battery(batt_w, dt_s)
@@ -206,29 +231,65 @@ class BESSEmulator:
             return 0.0
         return max(0.0, power + random.gauss(0, max(30, power * 0.02)))
 
-    def _pv_power_expected(self, utc_now: datetime) -> float:
+    def _pv_power_expected(self, utc_now: datetime,
+                           cloud_cover: Optional[float] = None) -> float:
         """Noise-free PV output for a UTC instant.
 
         Separated from the measured value so the optimizer can be handed a
         forecast built from exactly the physics the plant will follow,
         rather than a second, independently-drifting model of it.
+
+        Clear-sky output follows the real sun over the site. The previous
+        fixed curve (sunrise 05:30, sunset 20:30 local, full peak at noon)
+        was a June day all year round: in November it produced ~9 kW of
+        midday export and a 15-hour solar day, and the planned "expected
+        revenue" came out several times what the season allows.
         """
-        hour = kyiv_local_hour(utc_now)
-        if hour < 5.5 or hour > 20.5:
+        if utc_now.tzinfo is None:
+            utc_now = utc_now.replace(tzinfo=timezone.utc)
+        utc_now = utc_now.astimezone(timezone.utc)
+        sin_elev, cos_inc = self._sun_geometry(utc_now)
+        if sin_elev <= 0.0:
             return 0.0
 
-        # Clearsky irradiance: simple sinusoidal model
-        day_fraction = (hour - 5.5) / 15.0         # 0→1 sunrise to sunset
-        sin_val      = math.sin(math.pi * day_fraction) ** 1.15
-        clearsky_w   = self.cfg.pv_peak_kw * 1000.0 * sin_val
+        # Meinel clear-sky beam (kW/m²) through a Kasten-Young air mass, on
+        # the tilted array, plus ~10 % isotropic diffuse; 1 kW/m² = peak.
+        elev_deg = math.degrees(math.asin(sin_elev))
+        air_mass = 1.0 / (sin_elev + 0.50572 * (elev_deg + 6.07995) ** -1.6364)
+        beam = 1.353 * 0.7 ** (air_mass ** 0.678)
+        tilt = math.radians(self.cfg.pv_tilt_deg)
+        poa = beam * max(0.0, cos_inc) + 0.1 * beam * (1.0 + math.cos(tilt)) / 2.0
+        clearsky_w = self.cfg.pv_peak_kw * 1000.0 * min(1.0, poa)
 
         # Cloud cover attenuation
-        attenuation = 1.0 - 0.85 * self._cloud_cover
+        cover = self._cloud_cover if cloud_cover is None else cloud_cover
+        attenuation = 1.0 - 0.85 * cover
         # Temperature derating (panels lose ~0.4%/°C above 25°C NOCT)
         panel_temp   = max(25.0, 20.0 + 0.02 * clearsky_w / 100)
         temp_derating = max(0.8, 1.0 - 0.004 * (panel_temp - 25.0))
 
         return clearsky_w * attenuation * temp_derating * self.cfg.inverter_efficiency
+
+    def _sun_geometry(self, utc_now: datetime) -> tuple[float, float]:
+        """(sin of solar elevation, cos of incidence on the south-facing
+        array) at the site, from the NOAA declination / equation-of-time
+        series."""
+        hour = utc_now.hour + utc_now.minute / 60.0 + utc_now.second / 3600.0
+        g = 2.0 * math.pi / 365.0 * (utc_now.timetuple().tm_yday - 1 + (hour - 12.0) / 24.0)
+        eot_min = 229.18 * (0.000075 + 0.001868 * math.cos(g) - 0.032077 * math.sin(g)
+                            - 0.014615 * math.cos(2 * g) - 0.040849 * math.sin(2 * g))
+        decl = (0.006918 - 0.399912 * math.cos(g) + 0.070257 * math.sin(g)
+                - 0.006758 * math.cos(2 * g) + 0.000907 * math.sin(2 * g)
+                - 0.002697 * math.cos(3 * g) + 0.00148 * math.sin(3 * g))
+        solar_min = hour * 60.0 + eot_min + 4.0 * self.cfg.site_lon_deg
+        ha = math.radians(solar_min / 4.0 - 180.0)
+        lat = math.radians(self.cfg.site_lat_deg)
+        eff = lat - math.radians(self.cfg.pv_tilt_deg)   # tilted plane's "latitude"
+        sin_elev = (math.sin(lat) * math.sin(decl)
+                    + math.cos(lat) * math.cos(decl) * math.cos(ha))
+        cos_inc = (math.sin(eff) * math.sin(decl)
+                   + math.cos(eff) * math.cos(decl) * math.cos(ha))
+        return sin_elev, cos_inc
 
     def _compute_wind_power(self) -> float:
         """Measured wind power: the turbine curve plus sensor noise."""
@@ -280,9 +341,12 @@ class BESSEmulator:
         wind speed, held flat across the horizon: the turbine model has no
         diurnal structure to project, so its present output is the best
         available estimate and leaving it out entirely would understate
-        self-supply. Cloud cover is likewise carried forward from the
-        current observation, which is what a real site would do absent a
-        weather feed.
+        self-supply. Cloud cover is *not* held flat: it is the expected
+        value of its own OU process given the current observation, which
+        relaxes to the long-run mean within a few correlation times (~1 h).
+        Holding the cover seen at planning time (14:05 UTC) for the whole
+        next day made tomorrow's plan a coin flip between a cloudless and
+        an overcast day.
 
         Indexed by UTC hour so it lines up with the price curve the
         optimizer receives (see market_data.timebase).
@@ -297,13 +361,23 @@ class BESSEmulator:
         for h in range(24):
             at = datetime(day.year, day.month, day.day, h, tzinfo=timezone.utc)
             subs = [at + timedelta(minutes=m) for m in range(2, 60, 5)]
-            gen.append(sum(self._pv_power_expected(t) for t in subs) / len(subs) / 1000.0
+            gen.append(sum(self._pv_power_expected(t, self._expected_cloud_cover(t))
+                           for t in subs) / len(subs) / 1000.0
                        + wind_kw)
             load.append(sum(self._house_load_expected(t) for t in subs) / len(subs) / 1000.0)
         return gen, load
 
+    def _expected_cloud_cover(self, at: datetime) -> float:
+        """E[cloud cover at `at`] given the last observed value."""
+        if self._weather_ts is None:
+            return self._cloud_mu
+        lead_s = max(0.0, (at - self._weather_ts).total_seconds())
+        return (self._cloud_mu + (self._cloud_cover - self._cloud_mu)
+                * math.exp(-lead_s / self._cloud_tau_s))
+
     def _compute_dispatch(self, pv_w: float, wind_w: float,
-                          load_w: float, utc_now: datetime
+                          load_w: float, utc_now: datetime,
+                          dt_s: Optional[float] = None,
                           ) -> tuple[float, float]:
         """
         Dispatch logic: returns (battery_power_w, grid_power_w).
@@ -352,6 +426,19 @@ class BESSEmulator:
         # ── SoC limits, applied before grid flow is derived ───────────────
         if batt_w > 0 and self._soc_pct >= self.cfg.soc_max_pct:
             batt_w = 0.0
+
+        # Within one step the pack may only travel as far as its limits.
+        # Checking the limit alone at the start of the step let a 5-minute
+        # backfill tick at full power overshoot it by ~2 pp (8 % / 97 %).
+        if dt_s and dt_s > 0:
+            dt_h = dt_s / 3600.0
+            cap_wh = self.cfg.battery_capacity_kwh * 1000.0
+            if batt_w > 0:
+                room_wh = max(0.0, self.cfg.soc_max_pct - self._soc_pct) / 100.0 * cap_wh
+                batt_w = min(batt_w, room_wh / (self.cfg.charge_efficiency * dt_h))
+            elif batt_w < 0 and self._soc_pct > self.cfg.soc_min_pct:
+                avail_wh = (self._soc_pct - self.cfg.soc_min_pct) / 100.0 * cap_wh
+                batt_w = max(batt_w, -avail_wh * self.cfg.discharge_efficiency / dt_h)
 
         # Low-SoC / blackout-risk conditions are *transient*: they describe
         # the state right now, so they are recomputed (set AND cleared)
@@ -435,7 +522,7 @@ class BESSEmulator:
         wind generation in any synthetic day. The exact step is stable and
         statistically identical for every dt.
         """
-        self._cloud_cover = self._ou_step(self._cloud_cover, 0.3,
+        self._cloud_cover = self._ou_step(self._cloud_cover, self._cloud_mu,
                                           self._cloud_tau_s, self._cloud_sd, dt_s)
         self._cloud_cover = max(0.0, min(1.0, self._cloud_cover))
 
