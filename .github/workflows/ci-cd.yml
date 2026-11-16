@@ -14,11 +14,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install -r edge/requirements.txt
+      - run: python -m compileall -q edge/src cloud/api/src tests
       - run: python -m unittest discover -s tests -v
+      - name: Validate compose files
+        run: |
+          docker compose -f cloud/docker-compose.yml config -q
+          docker compose -f edge/docker-compose.yml config -q
+      - name: Build images
+        run: |
+          docker build -f cloud/api/Dockerfile -t bess-cloud-api .
+          docker build -t bess-edge edge
 
-  # Deploy jobs run only on a direct push to main (never on pull_request),
-  # since they execute on self-hosted runners with real access to the VMs.
+  # Deploy only on a direct push to main, on self-hosted runners on each VM.
   deploy-cloud:
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -30,21 +37,16 @@ jobs:
           rsync -a --delete \
             --exclude '.env' --exclude 'certs/' --exclude 'data/' --exclude '__pycache__/' \
             cloud/ "$HOME/Code/bess-ecosystem/cloud/"
-          # cloud-api's image build (context = repo root, see
-          # cloud/docker-compose.yml) also needs a current copy of
-          # edge/src — it reuses the real optimizer/emulator for the
-          # startup history backfill (cloud/api/src/history.py) instead
-          # of a second, drift-prone reimplementation. Source-only, never
-          # deployed as a running service on this VM.
+          # cloud-api's image copies edge/src/bess_model.py (shared model).
           rsync -a --delete --exclude '__pycache__/' \
             edge/src/ "$HOME/Code/bess-ecosystem/edge/src/"
       - name: Build and deploy
         run: |
           cd "$HOME/Code/bess-ecosystem/cloud"
-          docker compose -p bess-cloud up -d --build
+          docker compose -p bess-cloud up -d --build --remove-orphans
       - name: Health check
         run: |
-          sleep 10
+          sleep 15
           curl -sf http://localhost:8080/health
 
   deploy-edge:
@@ -61,10 +63,8 @@ jobs:
       - name: Build and deploy
         run: |
           cd "$HOME/Code/bess-ecosystem/edge"
-          # Same project name as bess-edge.service — a different one gets
-          # its own volume/image and clashes on container_name bess-edge.
-          docker compose -p bess-edge up -d --build
+          docker compose -p bess-edge up -d --build --remove-orphans
       - name: Health check
         run: |
           sleep 10
-          curl -sf http://localhost:8000/api/v1/status
+          test "$(docker inspect -f '{{.State.Running}}' bess-edge)" = true

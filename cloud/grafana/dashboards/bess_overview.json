@@ -1,19 +1,26 @@
 {
-  "__inputs": [],
-  "__requires": [],
-  "annotations": {
-    "list": []
-  },
-  "description": "BESS – огляд системи: потоки потужності, заряд батареї, стан мережі, ціни РДН та економіка",
+  "title": "BESS – Огляд системи",
+  "uid": "bess-overview-v1",
+  "description": "BESS MVP: заряд батареї (30–90 %), потоки потужності, ціни РДН, дохід. Доба = UTC.",
+  "tags": [
+    "bess"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 14,
   "editable": true,
   "graphTooltip": 1,
-  "id": null,
+  "refresh": "30s",
+  "time": {
+    "from": "now-2d/d",
+    "to": "now+1d/d"
+  },
   "templating": {
     "list": [
       {
         "name": "capex_uah",
         "type": "textbox",
-        "label": "Вартість системи, грн (для розрахунку окупності)",
+        "label": "Вартість системи, грн",
         "query": "250000",
         "current": {
           "value": "250000",
@@ -22,384 +29,395 @@
       }
     ]
   },
+  "annotations": {
+    "list": []
+  },
   "panels": [
     {
       "id": 1,
-      "title": "Заряд батареї (%)",
-      "description": "Поточний рівень заряду (SoC) батареї LiFePO4",
       "type": "gauge",
+      "title": "Заряд батареї (%)",
+      "datasource": "InfluxDB-BESS",
       "gridPos": {
-        "h": 6,
-        "w": 6,
         "x": 0,
-        "y": 0
+        "y": 0,
+        "w": 6,
+        "h": 7
       },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "InfluxDB-BESS",
+          "query": "from(bucket: \"telemetry\")\n  |> range(start: -1d)\n  |> filter(fn: (r) => r._measurement == \"telemetry\" and r._field == \"battery_soc_pct\")\n  |> group()\n  |> sort(columns: [\"_time\"])\n  |> last()\n  |> keep(columns: [\"_time\", \"_value\"])"
+        }
+      ],
       "fieldConfig": {
         "defaults": {
+          "unit": "percent",
           "min": 0,
           "max": 100,
-          "unit": "percent",
           "thresholds": {
+            "mode": "absolute",
             "steps": [
               {
                 "color": "red",
-                "value": 0
-              },
-              {
-                "color": "orange",
-                "value": 12
+                "value": null
               },
               {
                 "color": "green",
-                "value": 25
+                "value": 30
+              },
+              {
+                "color": "red",
+                "value": 90.001
               }
             ]
           }
-        }
+        },
+        "overrides": []
       },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": "InfluxDB-BESS",
-          "query": "from(bucket:\"telemetry\") |> range(start: -24h, stop: 24h) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"battery_soc_pct\") |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"]) |> group() |> sort(columns: [\"_time\"]) |> last() |> keep(columns: [\"_time\", \"_value\"])"
+      "options": {
+        "showThresholdMarkers": true,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
         }
-      ]
+      }
     },
     {
       "id": 2,
-      "title": "Потужність сонячних панелей (Вт)",
-      "description": "Миттєва вихідна потужність СЕС (сонячної електростанції). Діапазон часу — за верхнім перемикачем дашборду. Дані до поточного моменту — фактична телеметрія; далі в майбутнє — прогнозована проекція (пунктиром не позначено, але походить з окремого виміру telemetry_forecast).",
       "type": "timeseries",
+      "title": "Заряд батареї: факт + прогноз (коридор 30–90 %)",
+      "datasource": "InfluxDB-BESS",
       "gridPos": {
-        "h": 6,
-        "w": 9,
         "x": 6,
-        "y": 0
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "watt",
-          "color": {
-            "fixedColor": "yellow",
-            "mode": "fixed"
-          }
-        }
+        "y": 0,
+        "w": 18,
+        "h": 7
       },
       "targets": [
         {
           "refId": "A",
           "datasource": "InfluxDB-BESS",
-          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nnow_t = now()\nreal = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"pv_power_w\" and r._time <= now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nforecast = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry_forecast\" and r._field == \"pv_power_w\" and r._time > now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nunion(tables: [real, forecast]) |> set(key: \"_field\", value: \"Сонячні панелі\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
+          "query": "real = from(bucket: \"telemetry\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"telemetry\" and r._field == \"battery_soc_pct\" and r._time <= now())\nfc = from(bucket: \"telemetry\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"telemetry_forecast\" and r._field == \"battery_soc_pct\" and r._time > now())\nunion(tables: [real, fc])\n  |> group()\n  |> sort(columns: [\"_time\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> set(key: \"_field\", value: \"SoC\")\n  |> group(columns: [\"_field\"])"
         }
       ],
-      "interval": "5m"
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 30
+              },
+              {
+                "color": "red",
+                "value": 90.001
+              }
+            ]
+          },
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line+area"
+            }
+          }
+        },
+        "overrides": []
+      }
     },
     {
       "id": 3,
-      "title": "Баланс потужності системи (Вт)",
-      "description": "Позитивне значення: сонячна генерація / заряд батареї / купівля з мережі. Від'ємне: розряд батареї / продаж у мережу. Дані до поточного моменту — фактична телеметрія; далі в майбутнє — прогнозована проекція (пунктиром не позначено, але походить з окремого виміру telemetry_forecast).",
-      "type": "timeseries",
+      "type": "stat",
+      "title": "Дохід сьогодні, грн",
+      "datasource": "InfluxDB-BESS",
       "gridPos": {
-        "h": 6,
-        "w": 9,
-        "x": 15,
-        "y": 0
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "watt"
-        }
+        "x": 0,
+        "y": 7,
+        "w": 6,
+        "h": 4
       },
       "targets": [
         {
           "refId": "A",
           "datasource": "InfluxDB-BESS",
-          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nnow_t = now()\nreal = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"pv_power_w\" and r._time <= now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nforecast = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry_forecast\" and r._field == \"pv_power_w\" and r._time > now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nunion(tables: [real, forecast]) |> set(key: \"_field\", value: \"Сонячні панелі\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
+          "query": "import \"date\"\nd0 = date.truncate(t: now(), unit: 1d)\nfrom(bucket: \"telemetry\")\n  |> range(start: d0, stop: now())\n  |> filter(fn: (r) => r._measurement == \"telemetry\" and r._field == \"revenue_today_uah\")\n  |> group()\n  |> sort(columns: [\"_time\"])\n  |> last()\n  |> keep(columns: [\"_value\"])"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUAH",
+          "decimals": 2,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Дохід вчора, грн",
+      "datasource": "InfluxDB-BESS",
+      "gridPos": {
+        "x": 6,
+        "y": 7,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "InfluxDB-BESS",
+          "query": "import \"date\"\nd0 = date.truncate(t: now(), unit: 1d)\nfrom(bucket: \"telemetry\")\n  |> range(start: date.add(d: -1d, to: d0), stop: d0)\n  |> filter(fn: (r) => r._measurement == \"telemetry\" and r._field == \"revenue_today_uah\")\n  |> group()\n  |> sort(columns: [\"_time\"])\n  |> last()\n  |> keep(columns: [\"_value\"])"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUAH",
+          "decimals": 2,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Очікуваний дохід завтра, грн",
+      "datasource": "InfluxDB-BESS",
+      "gridPos": {
+        "x": 12,
+        "y": 7,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "InfluxDB-BESS",
+          "query": "import \"date\"\nd0 = date.truncate(t: now(), unit: 1d)\nfrom(bucket: \"telemetry\")\n  |> range(start: date.add(d: 1d, to: d0), stop: date.add(d: 2d, to: d0))\n  |> filter(fn: (r) => r._measurement == \"telemetry_forecast\" and r._field == \"revenue_today_uah\")\n  |> group()\n  |> sort(columns: [\"_time\"])\n  |> last()\n  |> keep(columns: [\"_value\"])"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUAH",
+          "decimals": 2,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Термін окупності системи, міс.",
+      "datasource": "InfluxDB-BESS",
+      "gridPos": {
+        "x": 18,
+        "y": 7,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "InfluxDB-BESS",
+          "query": "import \"date\"\nd0 = date.truncate(t: now(), unit: 1d)\ncapex = float(v: \"${capex_uah}\")\nfrom(bucket: \"telemetry\")\n  |> range(start: date.add(d: -30d, to: d0), stop: d0)\n  |> filter(fn: (r) => r._measurement == \"telemetry\" and r._field == \"revenue_today_uah\")\n  |> group()\n  |> sort(columns: [\"_time\"])\n  |> aggregateWindow(every: 1d, fn: last, createEmpty: false)\n  |> mean()\n  |> map(fn: (r) => ({_value: if r._value > 0.0 then capex / (r._value * 30.0) else -1.0}))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Баланс потужності (Вт)",
+      "datasource": "InfluxDB-BESS",
+      "gridPos": {
+        "x": 0,
+        "y": 11,
+        "w": 24,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "InfluxDB-BESS",
+          "query": "real = from(bucket: \"telemetry\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"telemetry\" and r._field == \"pv_power_w\" and r._time <= now())\nfc = from(bucket: \"telemetry\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"telemetry_forecast\" and r._field == \"pv_power_w\" and r._time > now())\nunion(tables: [real, fc])\n  |> group()\n  |> sort(columns: [\"_time\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> set(key: \"_field\", value: \"Сонячні панелі\")\n  |> group(columns: [\"_field\"])"
         },
         {
           "refId": "B",
           "datasource": "InfluxDB-BESS",
-          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nnow_t = now()\nreal = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"battery_power_w\" and r._time <= now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nforecast = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry_forecast\" and r._field == \"battery_power_w\" and r._time > now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nunion(tables: [real, forecast]) |> set(key: \"_field\", value: \"Батарея (+заряд/-розряд)\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
+          "query": "real = from(bucket: \"telemetry\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"telemetry\" and r._field == \"battery_power_w\" and r._time <= now())\nfc = from(bucket: \"telemetry\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"telemetry_forecast\" and r._field == \"battery_power_w\" and r._time > now())\nunion(tables: [real, fc])\n  |> group()\n  |> sort(columns: [\"_time\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> set(key: \"_field\", value: \"Батарея (+заряд/-розряд)\")\n  |> group(columns: [\"_field\"])"
         },
         {
           "refId": "C",
           "datasource": "InfluxDB-BESS",
-          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nnow_t = now()\nreal = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"grid_power_w\" and r._time <= now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nforecast = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry_forecast\" and r._field == \"grid_power_w\" and r._time > now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nunion(tables: [real, forecast]) |> set(key: \"_field\", value: \"Мережа (+купівля/-продаж)\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
+          "query": "real = from(bucket: \"telemetry\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"telemetry\" and r._field == \"grid_power_w\" and r._time <= now())\nfc = from(bucket: \"telemetry\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"telemetry_forecast\" and r._field == \"grid_power_w\" and r._time > now())\nunion(tables: [real, fc])\n  |> group()\n  |> sort(columns: [\"_time\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> set(key: \"_field\", value: \"Мережа (+купівля/-продаж)\")\n  |> group(columns: [\"_field\"])"
         },
         {
           "refId": "D",
           "datasource": "InfluxDB-BESS",
-          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nnow_t = now()\nreal = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"house_load_w\" and r._time <= now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nforecast = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry_forecast\" and r._field == \"house_load_w\" and r._time > now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nunion(tables: [real, forecast]) |> set(key: \"_field\", value: \"Навантаження будинку\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
+          "query": "real = from(bucket: \"telemetry\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"telemetry\" and r._field == \"house_load_w\" and r._time <= now())\nfc = from(bucket: \"telemetry\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"telemetry_forecast\" and r._field == \"house_load_w\" and r._time > now())\nunion(tables: [real, fc])\n  |> group()\n  |> sort(columns: [\"_time\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> set(key: \"_field\", value: \"Навантаження будинку\")\n  |> group(columns: [\"_field\"])"
         }
       ],
-      "interval": "5m"
-    },
-    {
-      "id": 4,
-      "title": "Температура батареї (°C)",
-      "type": "timeseries",
-      "gridPos": {
-        "h": 5,
-        "w": 12,
-        "x": 0,
-        "y": 6
-      },
       "fieldConfig": {
         "defaults": {
-          "unit": "celsius",
-          "thresholds": {
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "yellow",
-                "value": 40
-              },
-              {
-                "color": "red",
-                "value": 50
-              }
-            ]
-          }
-        }
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": "InfluxDB-BESS",
-          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nnow_t = now()\nreal = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"battery_temp_c\" and r._time <= now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nforecast = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry_forecast\" and r._field == \"battery_temp_c\" and r._time > now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nunion(tables: [real, forecast]) |> set(key: \"_field\", value: \"Температура батареї\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
-        }
-      ],
-      "description": " Дані до поточного моменту — фактична телеметрія; далі в майбутнє — прогнозована проекція (пунктиром не позначено, але походить з окремого виміру telemetry_forecast).",
-      "interval": "5m"
-    },
-    {
-      "id": 5,
-      "title": "Напруга мережі (В)",
-      "description": "Номінал 220В ±10% (195–253В) — межі показані на шкалі Дані до поточного моменту — фактична телеметрія; далі в майбутнє — прогнозована проекція (пунктиром не позначено, але походить з окремого виміру telemetry_forecast).",
-      "type": "timeseries",
-      "gridPos": {
-        "h": 5,
-        "w": 12,
-        "x": 12,
-        "y": 6
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "volt",
-          "min": 195,
-          "max": 253
-        }
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": "InfluxDB-BESS",
-          "query": "start = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nnow_t = now()\nreal = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"grid_voltage_v\" and r._time <= now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nforecast = from(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"telemetry_forecast\" and r._field == \"grid_voltage_v\" and r._time > now_t) |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\nunion(tables: [real, forecast]) |> set(key: \"_field\", value: \"Напруга мережі\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
-        }
-      ],
-      "interval": "5m"
-    },
-    {
-      "id": 6,
-      "title": "Дохід сьогодні, грн",
-      "description": "Фактично зароблено від початку поточної доби (UTC) і до цього моменту — сума за кожну годину: середня потужність обміну з мережею × 1 год × ціна РДН тієї години. Від'ємне значення означає, що система за цей період більше купила, ніж продала. Показник накопичується протягом доби, тому вранці він завжди менший за підсумок доби.",
-      "type": "stat",
-      "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 0,
-        "y": 11
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none",
-          "decimals": 2,
-          "thresholds": {
-            "steps": [
-              {
-                "color": "red",
-                "value": null
-              },
-              {
-                "color": "green",
-                "value": 0
-              }
-            ]
-          }
-        }
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": "InfluxDB-BESS",
-          "query": "import \"date\"\nd0 = date.truncate(t: now(), unit: 1d)\nd1 = now()\n// Revenue is integrated per hour, not summed per sample: energy = mean power\n// over the hour x 1 h. Summing a per-sample revenue field made the daily\n// total proportional to how many samples happened to be recorded, so an hour\n// the device was only partly online was under-counted in proportion.\npower = from(bucket:\"telemetry\")\n  |> range(start: d0, stop: d1)\n  |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"grid_power_w\")\n  |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\n  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false, timeSrc: \"_start\")\n  |> keep(columns: [\"_time\", \"_value\"])\n  |> rename(columns: {_value: \"w\"})\n// Price comes from the market curve, not from the dispatch schedule: it is a\n// fact about the day regardless of whether a schedule was loaded.\n// A day can carry price points from more than one source (a real oree\n// curve and the illustrative fallback both live under the same\n// measurement, distinguished only by the `source` tag). Dropping the tag\n// and taking last() picked between them non-deterministically, so the\n// same hour could be valued at a real 11 666 or a fallback 5 499.\n// Sorting by source descending puts \"oree\" ahead of \"fallback\", so the\n// real market price always wins where one exists.\nprice = from(bucket:\"telemetry\")\n  |> range(start: d0, stop: d1)\n  |> filter(fn:(r) => r._measurement == \"market_price\" and r._field == \"price_uah_mwh\")\n  |> drop(columns: [\"device_id\"])\n  |> group(columns: [\"_time\"])\n  |> sort(columns: [\"source\"], desc: true)\n  |> first()\n  |> group()\n  |> keep(columns: [\"_time\", \"_value\"])\n  |> rename(columns: {_value: \"p\"})\n// The hour in progress has only run for part of its length: its mean power\n// times a full hour would book the whole hour's energy at minute one.\ncur = date.truncate(t: now(), unit: 1h)\nfrac = float(v: uint(v: now()) - uint(v: cur)) / 3600000000000.0\nhourly = join(tables: {a: power, b: price}, on: [\"_time\"])\n  |> map(fn:(r) => ({_time: r._time, _value: -(r.w / 1000.0) * (r.p / 1000.0) * (if r._time == cur then frac else 1.0)}))\nhourly |> sum()"
-        }
-      ]
-    },
-    {
-      "id": 7,
-      "title": "Дохід вчора, грн",
-      "description": "Підсумок за повну попередню календарну добу (UTC), обчислений тим самим методом, що й «дохід сьогодні». Години, протягом яких вузол був недоступний, заповнюються стартовим сервісом історії фізично узгодженими даними, тому доба завжди повна.",
-      "type": "stat",
-      "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 6,
-        "y": 11
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none",
-          "decimals": 2,
-          "thresholds": {
-            "steps": [
-              {
-                "color": "red",
-                "value": null
-              },
-              {
-                "color": "green",
-                "value": 0
-              }
-            ]
-          }
-        }
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": "InfluxDB-BESS",
-          "query": "import \"date\"\nd0 = date.add(d: -1d, to: date.truncate(t: now(), unit: 1d))\nd1 = date.truncate(t: now(), unit: 1d)\n// Revenue is integrated per hour, not summed per sample: energy = mean power\n// over the hour x 1 h. Summing a per-sample revenue field made the daily\n// total proportional to how many samples happened to be recorded, so an hour\n// the device was only partly online was under-counted in proportion.\npower = from(bucket:\"telemetry\")\n  |> range(start: d0, stop: d1)\n  |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"grid_power_w\")\n  |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\n  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false, timeSrc: \"_start\")\n  |> keep(columns: [\"_time\", \"_value\"])\n  |> rename(columns: {_value: \"w\"})\n// Price comes from the market curve, not from the dispatch schedule: it is a\n// fact about the day regardless of whether a schedule was loaded.\n// A day can carry price points from more than one source (a real oree\n// curve and the illustrative fallback both live under the same\n// measurement, distinguished only by the `source` tag). Dropping the tag\n// and taking last() picked between them non-deterministically, so the\n// same hour could be valued at a real 11 666 or a fallback 5 499.\n// Sorting by source descending puts \"oree\" ahead of \"fallback\", so the\n// real market price always wins where one exists.\nprice = from(bucket:\"telemetry\")\n  |> range(start: d0, stop: d1)\n  |> filter(fn:(r) => r._measurement == \"market_price\" and r._field == \"price_uah_mwh\")\n  |> drop(columns: [\"device_id\"])\n  |> group(columns: [\"_time\"])\n  |> sort(columns: [\"source\"], desc: true)\n  |> first()\n  |> group()\n  |> keep(columns: [\"_time\", \"_value\"])\n  |> rename(columns: {_value: \"p\"})\nhourly = join(tables: {a: power, b: price}, on: [\"_time\"])\n  |> map(fn:(r) => ({_time: r._time, _value: -(r.w / 1000.0) * (r.p / 1000.0)}))\nhourly |> sum()"
-        }
-      ]
+          "unit": "watt"
+        },
+        "overrides": []
+      }
     },
     {
       "id": 8,
-      "title": "Очікуваний дохід завтра, грн",
-      "description": "ПРОГНОЗ, а не факт. Це сума поля expected_revenue_uah з 24-годинного розкладу, який обчислює оптимізатор (MILP, PuLP/CBC; за потреби — резервний евристичний алгоритм) на основі опублікованих цін РДН на завтра та поточного рівня заряду батареї. Тобто це дохід, який система планує отримати, якщо виконає розклад і фактична генерація збігнеться з моделлю. Якщо реальні ціни на завтра ще не опубліковані на oree.com.ua, розклад будується на резервному ціновому профілі — у такому разі значення є орієнтовним (джерело даних позначається тегом source).",
-      "type": "stat",
+      "type": "timeseries",
+      "title": "Ціна РДН (грн/МВт·год)",
+      "datasource": "InfluxDB-BESS",
       "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 12,
-        "y": 11
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none",
-          "decimals": 2,
-          "color": {
-            "fixedColor": "blue",
-            "mode": "fixed"
-          }
-        }
+        "x": 0,
+        "y": 19,
+        "w": 12,
+        "h": 7
       },
       "targets": [
         {
           "refId": "A",
           "datasource": "InfluxDB-BESS",
-          "query": "import \"date\"\nt0 = date.add(d: 1d, to: date.truncate(t: now(), unit: 1d))\nt1 = date.add(d: 2d, to: date.truncate(t: now(), unit: 1d))\n// One value per hour. Points written while `mode` was still a tag form a\n// separate series per mode; a later rewrite of the same hour (real-price\n// upgrade, the edge's own plan) then sat beside them and sum() counted the\n// hour two or three times. Tagless (current) points win over legacy ones.\nfrom(bucket:\"telemetry\")\n  |> range(start: t0, stop: t1)\n  |> filter(fn:(r) => r._measurement == \"schedule\" and r._field == \"expected_revenue_uah\")\n  |> map(fn:(r) => ({_time: r._time, _value: r._value, legacy: if exists r.mode then 1 else 0}))\n  |> group(columns: [\"_time\"])\n  |> sort(columns: [\"legacy\"])\n  |> first()\n  |> group()\n  |> sum()"
+          "query": "from(bucket: \"telemetry\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"market_price\" and r._field == \"price_uah_mwh\")\n  |> group()\n  |> sort(columns: [\"_time\"])\n  |> set(key: \"_field\", value: \"Ціна РДН\")\n  |> group(columns: [\"_field\"])"
         }
-      ]
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter"
+          }
+        },
+        "overrides": []
+      }
     },
     {
       "id": 9,
-      "title": "Термін окупності системи, міс.",
-      "type": "stat",
+      "type": "timeseries",
+      "title": "Температура батареї (°C)",
+      "datasource": "InfluxDB-BESS",
       "gridPos": {
-        "h": 4,
+        "x": 12,
+        "y": 19,
         "w": 6,
-        "x": 18,
-        "y": 11
-      },
-      "description": "Вартість системи (змінна capex_uah угорі дашборда), поділена на середній добовий дохід за останні 30 діб × 30. «Ще немає доходу» означає, що середній добовий дохід за період ≤ 0.",
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none",
-          "decimals": 1,
-          "color": {
-            "fixedColor": "purple",
-            "mode": "fixed"
-          },
-          "mappings": [
-            {
-              "type": "special",
-              "options": {
-                "match": "null",
-                "result": {
-                  "text": "Ще немає даних"
-                }
-              }
-            },
-            {
-              "type": "special",
-              "options": {
-                "match": "nan",
-                "result": {
-                  "text": "Ще немає даних"
-                }
-              }
-            },
-            {
-              "type": "value",
-              "options": {
-                "-1": {
-                  "text": "Ще немає доходу"
-                }
-              }
-            }
-          ]
-        }
+        "h": 7
       },
       "targets": [
         {
           "refId": "A",
           "datasource": "InfluxDB-BESS",
-          "query": "import \"date\"\nd0 = date.add(d: -30d, to: date.truncate(t: now(), unit: 1d))\nd1 = date.truncate(t: now(), unit: 1d)\n// Revenue is integrated per hour, not summed per sample: energy = mean power\n// over the hour x 1 h. Summing a per-sample revenue field made the daily\n// total proportional to how many samples happened to be recorded, so an hour\n// the device was only partly online was under-counted in proportion.\npower = from(bucket:\"telemetry\")\n  |> range(start: d0, stop: d1)\n  |> filter(fn:(r) => r._measurement == \"telemetry\" and r._field == \"grid_power_w\")\n  |> drop(columns: [\"grid_status\", \"inverter_mode\", \"device_id\"])\n  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false, timeSrc: \"_start\")\n  |> keep(columns: [\"_time\", \"_value\"])\n  |> rename(columns: {_value: \"w\"})\n// Price comes from the market curve, not from the dispatch schedule: it is a\n// fact about the day regardless of whether a schedule was loaded.\n// A day can carry price points from more than one source (a real oree\n// curve and the illustrative fallback both live under the same\n// measurement, distinguished only by the `source` tag). Dropping the tag\n// and taking last() picked between them non-deterministically, so the\n// same hour could be valued at a real 11 666 or a fallback 5 499.\n// Sorting by source descending puts \"oree\" ahead of \"fallback\", so the\n// real market price always wins where one exists.\nprice = from(bucket:\"telemetry\")\n  |> range(start: d0, stop: d1)\n  |> filter(fn:(r) => r._measurement == \"market_price\" and r._field == \"price_uah_mwh\")\n  |> drop(columns: [\"device_id\"])\n  |> group(columns: [\"_time\"])\n  |> sort(columns: [\"source\"], desc: true)\n  |> first()\n  |> group()\n  |> keep(columns: [\"_time\", \"_value\"])\n  |> rename(columns: {_value: \"p\"})\nhourly = join(tables: {a: power, b: price}, on: [\"_time\"])\n  |> map(fn:(r) => ({_time: r._time, _value: -(r.w / 1000.0) * (r.p / 1000.0)}))\ncapex = float(v: \"${capex_uah}\")\navgDaily = hourly\n  |> aggregateWindow(every: 1d, fn: sum, createEmpty: false)\n  |> mean()\navgDaily |> map(fn:(r) => ({ r with _value: if r._value > 0.0 then capex / (r._value * 30.0) else -1.0 }))"
+          "query": "real = from(bucket: \"telemetry\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"telemetry\" and r._field == \"battery_temp_c\" and r._time <= now())\nfc = from(bucket: \"telemetry\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"telemetry_forecast\" and r._field == \"battery_temp_c\" and r._time > now())\nunion(tables: [real, fc])\n  |> group()\n  |> sort(columns: [\"_time\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> set(key: \"_field\", value: \"Температура\")\n  |> group(columns: [\"_field\"])"
         }
-      ]
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "celsius"
+        },
+        "overrides": []
+      }
     },
     {
       "id": 10,
-      "title": "Ціна на ринку \"на добу наперед\" (грн/МВт·год)",
-      "description": "Реальні погодинні ціни РДН, отримані з офіційного сайту оператора ринку oree.com.ua. Діапазон часу — за верхнім перемикачем дашборду.",
       "type": "timeseries",
+      "title": "Напруга мережі (В)",
+      "datasource": "InfluxDB-BESS",
       "gridPos": {
-        "h": 6,
-        "w": 24,
-        "x": 0,
-        "y": 15
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none"
-        }
+        "x": 18,
+        "y": 19,
+        "w": 6,
+        "h": 7
       },
       "targets": [
         {
           "refId": "A",
           "datasource": "InfluxDB-BESS",
-          "query": "// One price per hour: \"oree\" sorts ahead of \"fallback\", so the real\n// market price wins where both exist (same rule as the revenue panels).\n// keep(): ungrouping turns _start/_stop into plain time columns, and\n// Grafana would take _start (one value for every row) as the time axis.\nstart = time(v: ${__from}000000)\nstop  = time(v: ${__to}000000)\nfrom(bucket:\"telemetry\") |> range(start: start, stop: stop) |> filter(fn:(r) => r._measurement == \"market_price\" and r._field == \"price_uah_mwh\") |> drop(columns: [\"device_id\"]) |> group(columns: [\"_time\"]) |> sort(columns: [\"source\"], desc: true) |> first() |> group() |> sort(columns: [\"_time\"]) |> drop(columns: [\"source\"]) |> set(key: \"_field\", value: \"Ціна РДН\") |> group(columns: [\"_field\"]) |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+          "query": "real = from(bucket: \"telemetry\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"telemetry\" and r._field == \"grid_voltage_v\" and r._time <= now())\nfc = from(bucket: \"telemetry\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"telemetry_forecast\" and r._field == \"grid_voltage_v\" and r._time > now())\nunion(tables: [real, fc])\n  |> group()\n  |> sort(columns: [\"_time\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> set(key: \"_field\", value: \"Напруга\")\n  |> group(columns: [\"_field\"])"
         }
-      ]
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "volt"
+        },
+        "overrides": []
+      }
     }
-  ],
-  "schemaVersion": 39,
-  "tags": [
-    "bess",
-    "energy",
-    "monitoring"
-  ],
-  "time": {
-    "from": "now-35d",
-    "to": "now+120d"
-  },
-  "timepicker": {},
-  "timezone": "browser",
-  "title": "BESS – Огляд системи",
-  "uid": "bess-overview-v1",
-  "version": 13
+  ]
 }
