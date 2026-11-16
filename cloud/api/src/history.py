@@ -104,6 +104,12 @@ async def ensure_history(writer: InfluxWriter, bucket: str, device_id: str,
         datetime.combine(yesterday, datetime.min.time(), tzinfo=timezone.utc),
         datetime.now(timezone.utc),
     )
+    yesterday = today - timedelta(days=1)
+    await writer.delete_range(
+        "telemetry", device_id,
+        datetime.combine(yesterday, datetime.min.time(), tzinfo=timezone.utc),
+        datetime.now(timezone.utc),
+    )
     optimizer = BESSOptimizer(OptimizerConfig())
     emulator  = BESSEmulator(EmulatorConfig(device_id=device_id))
     soc       = emulator.cfg.initial_soc_pct
