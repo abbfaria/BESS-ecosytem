@@ -30,9 +30,9 @@ class EmulatorConfig:
     battery_discharge_kw_max:float = 5.0
     charge_efficiency:       float = 0.96
     discharge_efficiency:    float = 0.96
-    soc_min_pct:             float = 10.0
-    soc_max_pct:             float = 95.0
-    initial_soc_pct:         float = 50.0
+    soc_min_pct:             float = 30.0
+    soc_max_pct:             float = 90.0
+    initial_soc_pct:         float = 60.0
 
     # House load baseline
     base_load_w:             float = 400.0    # always-on loads (W)

@@ -163,7 +163,9 @@ class EdgeOrchestrator:
                 # − grid_power_w = export (revenue).
                 price = self._current_price_uah_mwh(snapshot.battery_soc_pct)
                 snapshot.revenue_uah = compute_revenue_uah(
-                    snapshot.grid_power_w, TELEMETRY_INTERVAL_S, price
+                    snapshot.grid_power_w, TELEMETRY_INTERVAL_S, price,
+                    battery_power_w=snapshot.battery_power_w,
+                    inverter_mode=snapshot.inverter_mode,
                 )
 
                 snap_dict = snapshot.to_dict()

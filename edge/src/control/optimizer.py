@@ -45,8 +45,8 @@ class OptimizerConfig:
     battery_discharge_kw_max: float = 5.0
     charge_efficiency:        float = 0.96
     discharge_efficiency:     float = 0.96
-    soc_min_pct:              float = 10.0
-    soc_max_pct:              float = 95.0
+    soc_min_pct:              float = 30.0
+    soc_max_pct:              float = 90.0
     # Daily throughput limit to reduce cycle ageing (e.g. 1 full cycle/day)
     max_daily_throughput_kwh: float = 20.0
     # Revenue threshold: only dispatch if price > this (avoid tiny arbitrage)
@@ -57,7 +57,7 @@ class OptimizerConfig:
     # soc_min before the day ends — which then starves the *next* morning's
     # peak, day after day. Requiring a terminal reserve makes consecutive
     # single-day optimisations behave like a rolling schedule.
-    terminal_soc_pct:         float = 50.0
+    terminal_soc_pct:         float = 55.0
 
 
 @dataclass
@@ -316,7 +316,7 @@ class BESSOptimizer:
         actions = []
         for h in range(24):
             if h < start_hour:
-                actions.append(HourlyAction(h, "SOLAR_PRIORITY", price_uah_mwh=prices[h]))
+                actions.append(HourlyAction(h, "IDLE", price_uah_mwh=prices[h]))
             elif h in low_hours and soc < soc_hi:
                 energy_room = (soc_hi - soc) / 100.0 * cap
                 chg_kwh = min(p_max * eta_c, energy_room)
@@ -340,7 +340,7 @@ class BESSOptimizer:
                                             expected_revenue=round(rev, 2)))
 
             else:
-                actions.append(HourlyAction(h, "SOLAR_PRIORITY",
+                actions.append(HourlyAction(h, "IDLE",
                                             price_uah_mwh=prices[h]))
 
         log.info("Greedy schedule computed",

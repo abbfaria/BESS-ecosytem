@@ -110,7 +110,7 @@ class BESSEmulator:
 
     def set_soc(self, soc_pct: float) -> None:
         """Place the pack at a given state of charge (forecast anchoring)."""
-        self._soc_pct = max(0.0, min(100.0, float(soc_pct)))
+        self._soc_pct = max(self.cfg.soc_min_pct, min(self.cfg.soc_max_pct, float(soc_pct)))
 
     def restore(self, snapshot: dict) -> None:
         """Resume from the last recorded snapshot after a process restart.
@@ -496,7 +496,7 @@ class BESSEmulator:
         # Self-discharge: ~3% per month = 0.004%/hour
         self._soc_pct -= 0.004 * dt_h
         self._soc_pct += soc_delta
-        self._soc_pct  = max(0.0, min(100.0, self._soc_pct))
+        self._soc_pct  = max(self.cfg.soc_min_pct, min(self.cfg.soc_max_pct, self._soc_pct))
 
         # Thermal model (simple exponential)
         ambient = 22.0

@@ -98,6 +98,12 @@ async def ensure_history(writer: InfluxWriter, bucket: str, device_id: str,
     await _purge_synthetic_overlaps(writer, bucket, device_id,
                                     today - timedelta(days=BACKFILL_DAYS),
                                     today + timedelta(days=1))
+    yesterday = today - timedelta(days=1)
+    await writer.delete_range(
+        "telemetry", device_id,
+        datetime.combine(yesterday, datetime.min.time(), tzinfo=timezone.utc),
+        datetime.now(timezone.utc),
+    )
     optimizer = BESSOptimizer(OptimizerConfig())
     emulator  = BESSEmulator(EmulatorConfig(device_id=device_id))
     soc       = emulator.cfg.initial_soc_pct
@@ -236,7 +242,9 @@ async def _replay_day(writer: InfluxWriter, emulator: "BESSEmulator", device_id:
         emulator.force_mode(action.mode, action.charge_pct, action.discharge_pct)
         snapshot = await emulator.tick(as_of=ts, dt_s=float(step_seconds))
         snapshot.revenue_uah = compute_revenue_uah(
-            snapshot.grid_power_w, step_seconds, action.price_uah_mwh
+            snapshot.grid_power_w, step_seconds, action.price_uah_mwh,
+            battery_power_w=snapshot.battery_power_w,
+            inverter_mode=snapshot.inverter_mode,
         )
         last_soc = snapshot.battery_soc_pct
         await write(device_id, snapshot.to_dict())
