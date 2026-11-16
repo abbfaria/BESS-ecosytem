@@ -116,10 +116,13 @@ async def lifespan(app: FastAPI):
     global _influx
     _influx = InfluxDBClientAsync(url=INFLUXDB_URL, token=INFLUXDB_TOKEN, org=INFLUXDB_ORG)
     # Start from a clean bucket: every point is reproducible from bess_model.
-    await _influx.delete_api().delete(
-        start=datetime(1970, 1, 1, tzinfo=timezone.utc),
-        stop=datetime(2100, 1, 1, tzinfo=timezone.utc),
-        predicate="", bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG)
+    try:
+        await _influx.delete_api().delete(
+            start=datetime(1970, 1, 1, tzinfo=timezone.utc),
+            stop=datetime(2100, 1, 1, tzinfo=timezone.utc),
+            predicate="", bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG)
+    except Exception as exc:
+        log.error("Clearing the bucket failed: %s", exc)
     _tasks.append(asyncio.create_task(seed_loop()))
     _tasks.append(asyncio.create_task(mqtt_loop()))
     yield
